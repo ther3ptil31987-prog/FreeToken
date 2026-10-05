@@ -354,7 +354,7 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
@@ -492,7 +492,7 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -1054,20 +1054,9 @@ class OffloadMoeCache:
 
 
 def iter_offload_moe_layers(model) -> Iterator:
-    from freetoken.layers import BaseOP, OffloadMoELayer
+    from freetoken.layers import OffloadMoELayer, iter_moe_layers
 
-    if isinstance(model, OffloadMoELayer):
-        yield model
-
-    if not isinstance(model, BaseOP):
-        return
-
-    for value in model.__dict__.values():
-        if isinstance(value, BaseOP):
-            yield from iter_offload_moe_layers(value)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                yield from iter_offload_moe_layers(item)
+    return (layer for layer in iter_moe_layers(model) if isinstance(layer, OffloadMoELayer))
 
 
 def attach_offload_moe_cache(model, cache: OffloadMoeCache) -> list:

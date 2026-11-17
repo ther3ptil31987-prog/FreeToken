@@ -106,16 +106,19 @@ class TestPrimitives:
         ok = ~ref.isnan()
         assert torch.equal(out[ok], ref[ok])
 
-    def test_round_to_grid_bitexact(self):
+    @pytest.mark.parametrize("native_cast", [False, True], ids=["round_e4m3", "f32_to_e4m3"])
+    def test_round_to_grid_bitexact(self, native_cast):
         import triton
         import triton.language as tl
-        from freetoken.kernel.triton.e4m3_compat import round_e4m3
+        from freetoken.kernel.triton.e4m3_compat import f32_to_e4m3, round_e4m3
 
         @triton.jit
-        def k(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+        def k(x_ptr, y_ptr, N, BLOCK: tl.constexpr, NATIVE_CAST: tl.constexpr):
             offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
             m = offs < N
-            tl.store(y_ptr + offs, round_e4m3(tl.load(x_ptr + offs, mask=m, other=0.0)), mask=m)
+            x = tl.load(x_ptr + offs, mask=m, other=0.0)
+            y = f32_to_e4m3(x).to(tl.float32) if NATIVE_CAST else round_e4m3(x)
+            tl.store(y_ptr + offs, y, mask=m)
 
         torch.manual_seed(0)
         grid = torch.arange(256, dtype=torch.uint8, device="cuda").view(FP8).to(torch.float32)
@@ -131,7 +134,7 @@ class TestPrimitives:
         ]
         x = torch.cat(parts).clamp(-448, 448).contiguous()
         y = torch.empty_like(x)
-        k[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), BLOCK=1024)
+        k[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), BLOCK=1024, NATIVE_CAST=native_cast)
         ref = x.to(FP8).to(torch.float32)
         assert int(((y != ref) & ~(y.isnan() & ref.isnan())).sum()) == 0
 
@@ -217,7 +220,7 @@ def _emit_all(path: str) -> None:
     N, K = 128, 256
     pk = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=dev)
     sc = (torch.rand(N, K // 16, device=dev) * 2 + 0.1).to(FP8)
-    g = (torch.rand(N, device=dev) * 0.05 + 0.01).to(torch.float16)
+    g = torch.rand(N, device=dev) * 0.05 + 0.01
     xa = torch.randn(1, K, dtype=torch.bfloat16, device=dev)
     xb = torch.randn(8, K, dtype=torch.bfloat16, device=dev)
     xc = torch.randn(200, K, dtype=torch.bfloat16, device=dev)
@@ -231,7 +234,7 @@ def _emit_all(path: str) -> None:
     # nvfp4 bank dequant
     pkc = torch.randint(0, 256, (E, 64, 128), dtype=torch.uint8, device=dev)
     scc = (torch.rand(E, 64, 16, device=dev) + 0.1).to(FP8)
-    gc = (torch.rand(E, 64, device=dev) * 0.05 + 0.01).to(torch.float16)
+    gc = torch.rand(E, 64, device=dev) * 0.05 + 0.01
     out["nv_dequant"] = f32(dequant_nvfp4(
         pkc, scc, gc, torch.tensor([1, 3], dtype=torch.int32, device=dev)))
 
@@ -239,10 +242,10 @@ def _emit_all(path: str) -> None:
     S, H4, I4 = 4, 256, 128
     gup = torch.randint(0, 256, (S, 2 * I4, H4 // 2), dtype=torch.uint8, device=dev)
     gus4 = (torch.rand(S, 2 * I4, H4 // 16, device=dev) + 0.1).to(FP8)
-    gug = (torch.rand(S, 2 * I4, device=dev) * 0.05 + 0.01).to(torch.float16)
+    gug = torch.rand(S, 2 * I4, device=dev) * 0.05 + 0.01
     dnp = torch.randint(0, 256, (S, H4, I4 // 2), dtype=torch.uint8, device=dev)
     dns4 = (torch.rand(S, H4, I4 // 16, device=dev) + 0.1).to(FP8)
-    dng = (torch.rand(S, H4, device=dev) * 0.05 + 0.01).to(torch.float16)
+    dng = torch.rand(S, H4, device=dev) * 0.05 + 0.01
     hid4 = torch.randn(2, H4, dtype=torch.bfloat16, device=dev)
     out["nv_moe_marlin"] = f32(fused_experts_decode_nvfp4_marlin(
         hid4, gup, gus4, gug, dnp, dns4, dng, tw, tids))

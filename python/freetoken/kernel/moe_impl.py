@@ -34,7 +34,12 @@ def fused_moe_kernel_triton(
         even_Ks = True
     else:
         even_Ks = False
-    dtype = tl.bfloat16 if compute_type == torch.bfloat16 else tl.float16
+    if compute_type == torch.float32:
+        dtype = tl.float32
+    elif compute_type == torch.bfloat16:
+        dtype = tl.bfloat16
+    else:
+        dtype = tl.float16
     fused_moe_kernel[grid](
         A,
         B,
@@ -484,12 +489,15 @@ def mxfp4_splitk_gemv_triton(
     k_groups = K // 32
     kgps = triton.cdiv(k_groups, num_splits)
     lut = get_fp4_lut(x.device)
+    assert N % 2 == 0 and block_n % 2 == 0, "the kernel reads byte pairs of adjacent columns"
+    w16 = w_blocks_t.view(torch.int16)
+    s16 = w_scales_t.view(torch.int16)
 
     grid = (triton.cdiv(N, block_n), routes * num_splits)
     mxfp4_splitk_gemv_kernel[grid](
-        x, w_blocks_t, w_scales_t, bias_arg, expert_ids, partial, lut, N, K,
-        stride_xe, w_blocks_t.stride(0), w_blocks_t.stride(1),
-        w_scales_t.stride(0), w_scales_t.stride(1), bias_stride, N,
+        x, w16, s16, bias_arg, expert_ids, partial, lut, N, K,
+        stride_xe, w16.stride(0), w16.stride(1),
+        s16.stride(0), s16.stride(1), bias_stride, N,
         HAS_BIAS=has_bias, BLOCK_N=block_n,  # type: ignore
         NUM_K_SPLITS=num_splits, K_GROUPS_PER_SPLIT=kgps,  # type: ignore
         num_warps=num_warps,

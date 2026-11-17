@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .format import NONE, KVFormat
 
 
 class CacheManagerCreator(Protocol):
@@ -136,6 +137,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
+        kv_format=getattr(config, "kv_format", NONE),
     )
 
 
@@ -147,6 +150,8 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    num_speculative_tokens: int = 0,
+    kv_format: KVFormat = NONE,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -159,6 +164,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
+            kv_format=kv_format,
         )
 
     from .mha_pool import MHAKVCache
@@ -171,6 +177,8 @@ def create_kvcache_pool(
     # slabs.
     layer_ids: tuple[int, ...] | None = None
     kv_specs = [s for s in model_config.kv_cache_group_specs() if s.num_layers > 0]
+    if any(s.shared_layers for s in kv_specs):
+        raise NotImplementedError("KV-shared layers are only mapped by the hybrid full/SWA pool")
     if model_config.has_linear_attention:
         assert len(kv_specs) == 1, (
             f"hybrid-linear models support one paged-KV group, got "
@@ -198,6 +206,7 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
+            kv_format=kv_format,
         )
 
     # QSA (Qwen3.8-Flash-Next): the same GQA group, but it stores one index key per
@@ -222,8 +231,10 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
+            kv_format=kv_format,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -244,6 +255,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
+                kv_format=kv_format,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -263,6 +275,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
+            kv_format=kv_format,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
@@ -275,6 +288,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
+        kv_format=kv_format,
     )
 
 

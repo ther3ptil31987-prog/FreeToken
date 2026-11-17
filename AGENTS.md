@@ -34,6 +34,8 @@ benchmarks/            end-to-end and micro benchmarks, see benchmarks/README.md
 docs/                  install, quickstart, CLI and model docs
 freetoken-kernel-cache/ companion wheel of prebuilt kernels, see its README
 scripts/               wheel build and release scripts
+  checkpoint_diagnose/ why an HF safetensors checkpoint does not load, and fixes for non-standard ones
+  gguf_check/          which GGUF files of a family load
 ```
 
 ## Development
@@ -48,12 +50,24 @@ uv run pytest tests/ -m "not slow"
 
 CUDA kernels are JIT-compiled with `nvcc` on first use unless the prebuilt `freetoken-kernel-cache` wheel is installed. The C++ extensions under `python/freetoken/kernel/csrc/` are built by `setup.py`; after changing them run `python setup.py build_ext --inplace`.
 
-Put a new test in the `tests/` directory that mirrors the module it protects, and extend an existing file before creating a new one. Bug fixes come with a test that fails before and passes after. Performance changes come with A/B numbers against `main`.
+The ggml kernels under `python/freetoken/kernel/csrc/ggml/` are copied from llama.cpp and edited in place. See `docs/ggml-kernels.md` before changing or updating them.
+
+Performance changes come with A/B numbers against `main`.
+
+## Tests
+
+A test is code someone keeps green and updates on every refactor. The suite should grow with the engine's silent failure modes, not with the number of PRs. The rules, for fixes, features and new models alike, are in [tests/README.md](tests/README.md#what-earns-a-place-here); read them before writing a test. The parts agents most often get wrong:
+
+- Verify a fix by re-running what failed (the command, request, or checkpoint from the issue) and report the result. If you cannot run it (missing hardware or checkpoint), say so and say what you ran instead. Verification alone does not call for a new test.
+- Before adding a test, name the future change that would turn it red. If the only answer is "editing the test", do not write it. A crash or error on a path anyone runs shows itself and needs no test.
+- Extend an existing `parametrize`, table, or test file before creating anything. Ask the user before adding a test file, directory, fixture, or helper, and before deleting a test.
+- A new model's own tests go in `tests/models/<model>/` without asking, and meet the same bar: parity against its reference, not copies of the config, registry, and smoke tests every model shares.
 
 ## Issues and PRs
 
 - Search existing issues and PRs before starting. Items on the [Roadmap](https://github.com/FlashML-org/FreeToken/issues/79) are discussed with maintainers before implementation; features not on it start as an issue.
-- When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint ID, exact command, and the full log.
+- When helping the user draft an issue, follow the matching template in `.github/ISSUE_TEMPLATE/` (engine bug, model checkpoint, feature request) and fill in every required field: hardware, driver, FreeToken version, checkpoint link, exact command, and the full log.
+- When a checkpoint fails to load, follow [scripts/checkpoint_diagnose/README.md](scripts/checkpoint_diagnose/README.md) before drafting a model checkpoint issue: it tells a FreeToken gap from a non-standard checkpoint, and repairs the latter.
 - One change per PR, linked to its issue, with the hardware, checkpoint ID and exact command it was tested with.
 
 ## Code comments

@@ -7,6 +7,8 @@ from typing import ClassVar, NamedTuple
 import torch
 from freetoken.utils import div_even, init_logger, mem_GB
 
+from .format import NONE, KVFormat
+
 logger = init_logger(__name__)
 
 
@@ -16,8 +18,8 @@ class CacheRebuildRejected(Exception):
     this is recoverable, unlike a failure after the free."""
 
 
-def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
+def spec_kv_bytes_per_token(spec, config, fmt: KVFormat = NONE) -> int:
+    """One paged-KV group's bytes per token: (1|2 slabs) x row bytes of ``fmt`` x local kv heads
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
@@ -27,9 +29,8 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
-        * spec.head_dim
+        * fmt.row_bytes(spec.head_dim, config.dtype, segments=2 if spec.mla else 1)
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
@@ -52,6 +53,9 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+    # KV formats this pool family can store
+    kv_formats: ClassVar[frozenset[str]] = frozenset({NONE.name})
+    kv_format: KVFormat = NONE
 
     @classmethod
     def window_spec(cls, config) -> WindowPoolSpec | None:
@@ -103,11 +107,12 @@ class BaseKVCachePool(ABC):
     def validate_rebuild(
         self, config, *, num_pages: int | None, target_moe: int, per_expert_bytes: int,
         baseline_free: int, weights_bytes: int, current_num_pages: int,
-        extra_fixed_bytes: int = 0, extra_note: str = "", **targets,
+        extra_fixed_bytes: int = 0, extra_page_bytes: int = 0, extra_note: str = "", **targets,
     ) -> None:
         """Budget fit-check for a runtime rebuild target, BEFORE any destructive free.
-        The engine supplies the memory account (baseline/weights, the MoE terms, and any
-        sibling pool's fixed bytes at ITS target, e.g. the GDN state pool); the pool
+        The engine supplies the memory account (baseline/weights, the MoE terms, any
+        sibling pool's fixed bytes at ITS target, e.g. the GDN state pool, and bytes that
+        scale with the page count, e.g. a speculative draft's KV); the pool
         answers whether its own target geometry fits. Raises CacheRebuildRejected.
 
         The base names no family-specific target: the engine forwards the whole request
@@ -129,7 +134,7 @@ class BaseKVCachePool(ABC):
             config.memory_ratio, baseline_free, weights_bytes,
             fixed_cache_size + extra_fixed_bytes,
         )
-        need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
+        need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page + extra_page_bytes)
         if need > budget:
             raise CacheRebuildRejected(
                 f"requested cache (moe={target_moe} slots, kv={target_pages} pages{extra_note}) "
@@ -161,6 +166,12 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        return None
 
     @abstractmethod
     def store_kv(

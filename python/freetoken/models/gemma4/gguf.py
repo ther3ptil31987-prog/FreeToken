@@ -6,14 +6,16 @@ final-logit softcap), so this produces the *same* ``ModelConfig`` as
 ``gemma4.config.parse_config`` -- only the source is GGUF KV metadata instead of a
 HF config object. transformers' own GGUF->config conversion is rejected by the
 gemma4 strict dataclass (per-layer ``num_key_value_heads`` array), so we read the
-metadata directly. ``expert_quant`` is set to ``"q4_0"`` to route the routed experts
-through the native-Q4_0 offload-cache path.
+metadata directly. Every tensor keeps its packed ggml type (``QuantKind.GGUF``); the
+routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterator
+import re
+from typing import TYPE_CHECKING, Any, Iterator
 
+import numpy as np
 import torch
 
 from freetoken.models.config import (
@@ -22,7 +24,11 @@ from freetoken.models.config import (
     RotaryConfig,
     SWAAttentionGroupConfig,
 )
-from freetoken.models.gguf.dequant import GGML_Q4_0, GGML_Q6_K, dequantize, row_bytes
+from freetoken.models.gguf.mmproj import Mmproj, find_mmproj, log_mmproj, mmproj_tensor
+from freetoken.models.gguf.reader import gguf_architecture, gguf_tensor_index, load_gguf_metadata
+from freetoken.models.gguf.tensors import check_scales, float_tensor, fused, matrix, table_matrix, weight_scale
+
+from .config import Gemma4EArgs, _parse_vision_config, gemma4_e_args
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
@@ -36,19 +42,174 @@ def _full_rotary_dim(shim: "GgufConfigShim", full_head_dim: int) -> int:
     which drives the unrotated tail's frequencies to zero (ggml ops.cpp ``theta / ff``).
     Count the untouched entries to get the rotated width back.
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-
-    for t in iter_gguf_tensors(shim.model_path):
-        if t.name == "rope_freqs.weight":  # F32, so the packed bytes ARE the values
-            freqs = t.packed().reshape(-1).view(torch.float32)
-            return int((freqs == 1.0).sum().item()) * 2
+    info = gguf_tensor_index(shim.model_path).get("rope_freqs.weight")
+    if info is not None:
+        return int((float_tensor(info) == 1.0).sum().item()) * 2
     # A metadata-only GGUF (an FTW dir's source_metadata.gguf) has no tensor table. Every
     # released gemma4 sets partial_rotary_factor 0.25 on the full layers, and the converter
     # asserts rope_type == "proportional" (llama.cpp conversion/gemma.py).
     return full_head_dim // 4
 
 
+# --------------------------------------------------------------------------------------
+# Vision: the tower from a llama.cpp mmproj file. gemma4v is the ViT of the 26B-A4B and 31B releases, gemma4uv the linear embedder of the 12B "unified" release.
+# --------------------------------------------------------------------------------------
+
+_VIT, _UNIFIED = "gemma4v", "gemma4uv"
+_TOKENS = {"image_token_id": "<|image|>", "boi_token_id": "<|image>", "eoi_token_id": "<image|>"}
+# llama.cpp hardcodes these and the mmproj does not store them; the values match the HF configs
+_POOLING_KERNEL = 3
+_ROPE_THETA = 100.0
+_MAX_SOFT_TOKENS = 280
+
+_VIT_TOP = {
+    "v.position_embd.weight": "vision_tower.patch_embedder.position_embedding_table",
+    "v.std_bias": "vision_tower.std_bias",
+    "v.std_scale": "vision_tower.std_scale",
+    "mm.input_projection.weight": "embed_vision.embedding_projection.weight",
+}
+_VIT_BLOCK = {
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_out": "self_attn.o_proj",
+    "attn_q_norm": "self_attn.q_norm",
+    "attn_k_norm": "self_attn.k_norm",
+    "ln1": "input_layernorm",
+    "attn_post_norm": "post_attention_layernorm",
+    "ln2": "pre_feedforward_layernorm",
+    "ffn_post_norm": "post_feedforward_layernorm",
+    "ffn_gate": "mlp.gate_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+}
+_VIT_BLOCK_RE = re.compile(r"^v\.blk\.(\d+)\.(\w+)\.weight$")
+# tensors over the patch features, stored channel-major
+_UNIFIED_PATCH = {
+    "v.patch_embd.weight": "vision_embedder.patch_dense.weight",
+    "v.patch_norm.1.weight": "vision_embedder.patch_ln1.weight",
+    "v.patch_norm.1.bias": "vision_embedder.patch_ln1.bias",
+}
+_UNIFIED_TOP = {
+    "v.patch_embd.bias": "vision_embedder.patch_dense.bias",
+    "v.patch_norm.2.weight": "vision_embedder.patch_ln2.weight",
+    "v.patch_norm.2.bias": "vision_embedder.patch_ln2.bias",
+    "v.patch_norm.3.weight": "vision_embedder.pos_norm.weight",
+    "v.patch_norm.3.bias": "vision_embedder.pos_norm.bias",
+    "mm.input_projection.weight": "embed_vision.embedding_projection.weight",
+}
+
+
+def _f32_value(v: float) -> float:
+    """The shortest decimal of a float32 metadata value: 1e-06, as the HF config writes it, not 9.99999997e-07."""
+    return float(str(np.float32(v)))
+
+
+def gguf_mm_config(text_md: dict[str, Any], mmproj: Mmproj, vocab_size: int, *, model_path: str = "") -> tuple[dict[str, Any], dict[str, Any]]:
+    """The HF config.json keys and the preprocessor_config.json of the tower in ``mmproj``, for the text GGUF whose metadata is ``text_md``."""
+    if mmproj.projector not in (_VIT, _UNIFIED):
+        raise ValueError(f"mmproj {mmproj.path} is a {mmproj.projector!r} tower; Gemma 4 needs {_VIT!r} or {_UNIFIED!r}")
+    md, index = load_gguf_metadata(mmproj.path), gguf_tensor_index(mmproj.path)
+
+    def kv(key: str):
+        return md[f"clip.vision.{key}"]
+
+    text_hidden = int(text_md["gemma4.embedding_length"])
+    if int(kv("projection_dim")) != text_hidden:
+        raise ValueError(f"mmproj {mmproj.path} projects to {int(kv('projection_dim'))} but the text model is {text_hidden} wide")
+    tokens = text_md["tokenizer.ggml.tokens"]
+    missing = [t for t in _TOKENS.values() if t not in tokens]
+    if missing:
+        raise ValueError(f"the text GGUF tokenizer has no {missing} tokens")
+    patch_size = int(kv("patch_size"))
+    eps = _f32_value(kv("attention.layer_norm_epsilon"))
+    if mmproj.projector == _VIT:
+        head_dim = int(index["v.blk.0.attn_q_norm.weight"].ne[0])
+        vision_config = {
+            "hidden_size": int(kv("embedding_length")),
+            "num_hidden_layers": int(kv("block_count")),
+            "num_attention_heads": int(kv("attention.head_count")),
+            "num_key_value_heads": int(index["v.blk.0.attn_k.weight"].ne[1]) // head_dim,
+            "head_dim": head_dim,
+            "intermediate_size": int(kv("feed_forward_length")),
+            "patch_size": patch_size,
+            # ggml order [hidden, table, axis]
+            "position_embedding_size": int(index["v.position_embd.weight"].ne[1]),
+            "pooling_kernel_size": _POOLING_KERNEL,
+            "rms_norm_eps": eps,
+            "rope_parameters": {"rope_theta": _ROPE_THETA},
+            "hidden_activation": "gelu_pytorch_tanh",
+            "standardize": "v.std_bias" in index,
+            "use_clipped_linears": "v.blk.0.attn_q.input_max" in index,
+        }
+        processor_type = "Gemma4ImageProcessor"
+    else:
+        # ggml order [patch_dim, hidden]; patch_dim = 3 * model_patch_size**2
+        patch_dim = int(index["v.patch_embd.weight"].ne[0])
+        vision_config = {
+            "mm_embed_dim": int(index["v.patch_embd.weight"].ne[1]),
+            "model_patch_size": round((patch_dim // 3) ** 0.5),
+            "mm_posemb_size": int(index["v.position_embd.weight"].ne[1]),
+            "patch_size": patch_size,
+            "pooling_kernel_size": _POOLING_KERNEL,
+            "rms_norm_eps": eps,
+        }
+        processor_type = "Gemma4UnifiedImageProcessor"
+    hf_fields = {"vision_config": vision_config, **{key: tokens.index(t) for key, t in _TOKENS.items()}}
+    preprocessor = {
+        "image_processor_type": processor_type,
+        "patch_size": patch_size,
+        "pooling_kernel_size": _POOLING_KERNEL,
+        "max_soft_tokens": _MAX_SOFT_TOKENS,
+        "image_mean": [float(v) for v in kv("image_mean")],
+        "image_std": [float(v) for v in kv("image_std")],
+        "resample": 3,
+        "do_convert_rgb": True,
+        "do_resize": True,
+        "do_rescale": True,
+        "rescale_factor": 1 / 255,
+        "do_normalize": False,
+    }
+    return hf_fields, preprocessor
+
+
+def _hwc(t: torch.Tensor, patch: int) -> torch.Tensor:
+    """Patch features from llama.cpp's channel-major order back to the HF processor's (y, x, channel) order, along the last dim."""
+    lead = t.shape[:-1]
+    return t.reshape(*lead, 3, patch, patch).movedim(-3, -1).reshape(*lead, -1)
+
+
+def iter_mmproj_weights(mmproj: Mmproj) -> Iterator[tuple[str, torch.Tensor]]:
+    """The tower state dict, named as the HF checkpoints load; audio tensors of a unified mmproj are skipped."""
+    index = gguf_tensor_index(mmproj.path)
+    for name, info in index.items():
+        if name.startswith(("a.", "mm.a.")):
+            continue
+        t = mmproj_tensor(info)
+        if mmproj.projector == _VIT:
+            if name == "v.patch_embd.weight":
+                # [hidden, 3, p, p] -> [hidden, p * p * 3]
+                yield "vision_tower.patch_embedder.input_proj.weight", _hwc(t.flatten(1), t.shape[-1])
+            elif name in _VIT_TOP:
+                yield _VIT_TOP[name], t
+            elif (m := _VIT_BLOCK_RE.match(name)) and m[2] in _VIT_BLOCK:
+                yield f"vision_tower.encoder.layers.{m[1]}.{_VIT_BLOCK[m[2]]}.weight", t
+            else:
+                raise ValueError(f"unexpected tensor {name!r} in a {_VIT} mmproj")
+            continue
+        if name in _UNIFIED_PATCH:
+            yield _UNIFIED_PATCH[name], _hwc(t, round((t.shape[-1] // 3) ** 0.5))
+        elif name == "v.position_embd.weight":
+            # [axis, table, hidden] -> [table, axis, hidden]
+            yield "vision_embedder.pos_embedding", t.transpose(0, 1)
+        elif name in _UNIFIED_TOP:
+            yield _UNIFIED_TOP[name], t
+        else:
+            raise ValueError(f"unexpected tensor {name!r} in a {_UNIFIED} mmproj")
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
+    check_scales(shim.model_path, known=("ffn_gate_inp.scale", "ffn_down_exps.scale"))
     m = shim.metadata
 
     def g(key: str):
@@ -59,12 +220,21 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 
     num_layers = int(g("block_count"))
     hidden = int(g("embedding_length"))
+    num_experts = int(m.get("gemma4.expert_count", 0))
     num_qo_heads = int(g("attention.head_count"))
-    kv_per_layer = g("attention.head_count_kv")  # per-layer list
+    # per-layer lists, or one value for every layer
+    kv_per_layer = g("attention.head_count_kv")
+    if not isinstance(kv_per_layer, (list, tuple)):
+        kv_per_layer = [kv_per_layer] * num_layers
+    ffn_per_layer = g("feed_forward_length")
+    if not isinstance(ffn_per_layer, (list, tuple)):
+        ffn_per_layer = [ffn_per_layer] * num_layers
+    ffn_per_layer = [int(x) for x in ffn_per_layer]
     # True -> sliding-window (SWA) layer, False -> full attention.
     swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
     assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
 
+    vision_config = _parse_vision_config(shim, hidden)
     swa_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if is_swa)
     full_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if not is_swa)
 
@@ -73,6 +243,28 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     swa_kv = int(kv_per_layer[swa_layer_ids[0]]) if swa_layer_ids else int(kv_per_layer[0])
     full_kv = int(kv_per_layer[full_layer_ids[0]]) if full_layer_ids else int(kv_per_layer[0])
 
+    # Full layers ship no v in the GGUF (k is reused as v), except on E2B / E4B. A metadata-only
+    # GGUF (an FTW dir's source_metadata.gguf) has no tensor table, so there the key has to say.
+    index = gguf_tensor_index(shim.model_path)
+    full_k_eq_v = (
+        not any(f"blk.{i}.{part}.weight" in index for i in full_layer_ids for part in ("attn_v", "attn_qkv"))
+        if index
+        else "gemma4.attention.value_length" not in m
+    )
+    e_args = gemma4_e_args(
+        num_layers,
+        int(m.get("gemma4.embedding_length_per_layer_input", 0)),
+        int(shim.vocab_size),
+        int(m.get("gemma4.attention.shared_kv_layers", 0)),
+        num_experts,
+        ffn_per_layer[-1],
+    )
+    # the config holds one MLP width, and one more for the KV-shared layers (E2B doubles theirs)
+    if ffn_per_layer != [
+        e_args.kv_shared_intermediate_size if e_args is not None and e_args.is_kv_shared(i) else ffn_per_layer[0]
+        for i in range(num_layers)
+    ]:
+        raise NotImplementedError(f"gemma4 GGUF MLP widths {sorted(set(ffn_per_layer))} do not split at the KV-shared layers")
     max_pos = int(g("context_length"))
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
@@ -100,24 +292,27 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         head_dim=full_head_dim,
         hidden_size=hidden,
         vocab_size=int(shim.vocab_size),
-        intermediate_size=int(g("feed_forward_length")),
+        intermediate_size=ffn_per_layer[0],
         hidden_act="gelu_tanh",
         rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
         tie_word_embeddings=bool(shim.tie_word_embeddings),
         rotary_config=full_rotary,
-        num_experts=int(g("expert_count")),
-        num_experts_per_tok=int(g("expert_used_count")),
-        moe_intermediate_size=int(g("expert_feed_forward_length")),
+        num_experts=num_experts,
+        num_experts_per_tok=int(g("expert_used_count")) if num_experts else 0,
+        moe_intermediate_size=int(g("expert_feed_forward_length")) if num_experts else 0,
         norm_topk_prob=True,
         model_type="gemma4",
         architectures=list(shim.architectures),
-        moe_enabled=True,
-        expert_quant="q4_0",
-        moe_weight_format="q4_0",
+        moe_enabled=num_experts > 0,
+        expert_quant="gguf" if num_experts else "none",
         use_qk_norm=True,
         attn_sm_scale=1.0,
         final_logit_softcapping=float(g("final_logit_softcapping")),
         embedding_scale=float(hidden) ** 0.5,
+        vision_config=vision_config,
+        image_token_id=getattr(shim, "image_token_id", None),
+        gemma4_e_args=e_args,
+        kv_shared_layers=e_args.kv_shared_layers(full_layer_ids, swa_layer_ids) if e_args is not None else (),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -125,8 +320,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 num_kv_heads=full_kv,
                 head_dim=full_head_dim,
                 rotary_config=full_rotary,
-                # Full layers ship no v_proj in the GGUF (k reused as v).
-                k_eq_v=True,
+                k_eq_v=full_k_eq_v,
             ),
             SWAAttentionGroupConfig(
                 name="swa",
@@ -135,6 +329,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
                 head_dim=swa_head_dim,
                 rotary_config=swa_rotary,
                 sliding_window=int(g("attention.sliding_window")),
+                # every Gemma 4 vision release sets use_bidirectional_attention="vision"
+                bidirectional_mm_blocks=vision_config is not None,
             ),
         ),
     )
@@ -144,31 +340,71 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
 # Weight loading: GGUF tensor names -> FreeToken gemma4 module params.
 # --------------------------------------------------------------------------------------
 
-# Per-layer 1:1 norm/scale tensors (gguf suffix -> freetoken module-relative name). All
-# are tiny F32 tensors dequantized to bf16.
+# Per-layer 1:1 norm/scale tensors (gguf suffix -> freetoken module-relative name), all F32.
 _LAYER_SCALAR_MAP = {
     "attn_norm.weight": "input_layernorm.weight",
     "attn_q_norm.weight": "self_attn.q_norm.weight",
     "attn_k_norm.weight": "self_attn.k_norm.weight",
     "post_attention_norm.weight": "post_attention_layernorm.weight",
     "ffn_norm.weight": "pre_feedforward_layernorm.weight",
-    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm.weight": "feed_forward.post_feedforward_layernorm.weight",
+    "layer_output_scale.weight": "feed_forward.layer_scalar",
+}
+# the MoE layers' second feed-forward branch and router
+_MOE_LAYER_SCALAR_MAP = {
+    "pre_ffw_norm_2.weight": "feed_forward.pre_feedforward_layernorm_2.weight",
     "post_ffw_norm_1.weight": "feed_forward.post_feedforward_layernorm_1.weight",
     "post_ffw_norm_2.weight": "feed_forward.post_feedforward_layernorm_2.weight",
-    "layer_output_scale.weight": "feed_forward.layer_scalar",
     "ffn_gate_inp.weight": "feed_forward.router.proj.weight",
     "ffn_gate_inp.scale": "feed_forward.router.scale",
     "ffn_down_exps.scale": "feed_forward.router.per_expert_scale",
 }
-# Expert weight tensors (handled by the offload bank loader, not iter_gguf_weights).
-_EXPERT_SUFFIXES = ("ffn_gate_up_exps.weight", "ffn_down_exps.weight")
+
+# E2B / E4B's per-layer input
+_PER_LAYER_SCALAR_MAP = {
+    "post_norm.weight": "post_per_layer_input_norm.weight",
+}
+
+# checkpoint module leaf (gemma4 HF naming) -> GGUF tensor
+_LAYER_LEAVES = {
+    "per_layer_input_gate": "inp_gate",
+    "per_layer_projection": "proj",
+    "self_attn.q_proj": "attn_q",
+    "self_attn.k_proj": "attn_k",
+    "self_attn.o_proj": "attn_output",
+    "mlp.gate_proj": "ffn_gate",
+    "mlp.up_proj": "ffn_up",
+    "mlp.down_proj": "ffn_down",
+    "experts.0.gate_proj": "ffn_gate_exps",
+    "experts.0.up_proj": "ffn_up_exps",
+    "experts.0.down_proj": "ffn_down_exps",
+}
+_LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 
 
-def _to_bf16(t) -> torch.Tensor:
-    """Dequantize a GgufTensor (F32/F16/Q*) to a dense bf16 tensor of its torch shape."""
-    flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.bfloat16)
-    return flat.reshape(t.shape)
+def to_gguf(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Checkpoint module name -> the GGUF tensors (without ``.weight``) that store it; empty for modules the GGUF has no matrix for."""
+    if name == "model.embed_tokens":
+        return ("token_embd",)
+    if name == "model.embed_tokens_per_layer":
+        return ("per_layer_token_embd",)
+    if name == "model.per_layer_model_projection":
+        return ("per_layer_model_proj",)
+    if name == "lm_head":
+        return ("output",) if "output.weight" in tensors else ()
+    m = _LAYER_RE.match(name)
+    if m is None:
+        return ()
+    blk, leaf = f"blk.{m.group(1)}", m.group(2)
+    if leaf in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") and f"{blk}.attn_qkv.weight" in tensors:
+        return (f"{blk}.attn_qkv",)
+    if leaf == "self_attn.v_proj":
+        # the full-attention layers store no attn_v: k is reused as v
+        return (f"{blk}.attn_v",) if f"{blk}.attn_v.weight" in tensors else (f"{blk}.attn_k",)
+    if leaf in ("experts.0.gate_proj", "experts.0.up_proj") and f"{blk}.ffn_gate_up_exps.weight" in tensors:
+        return (f"{blk}.ffn_gate_up_exps",)
+    tensor = _LAYER_LEAVES.get(leaf)
+    return (f"{blk}.{tensor}",) if tensor is not None else ()
 
 
 def _require_tp1(what: str) -> None:
@@ -190,285 +426,280 @@ def iter_gguf_weights(
     *,
     include_moe_experts: bool,
     include_non_moe: bool,
+    include_vision: bool = True,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield (param_name, tensor) for every non-expert gemma4 param.
-
-    Quantized projections (attention q/k/v/o, shared-MLP gate/up/down) and the
-    embedding stay in their native packed block layout and are yielded as ``.qweight``
-    (uint8); norms / router / per-layer scalars dequantize to bf16. q/k/v and gate/up
-    are fused by concatenating packed rows along the output dim (same input dim ->
-    same ``row_bytes``). Routed experts are served from the offload cache, so they are
-    skipped here (asserts the offload contract like the other MoE models).
-    """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
+    """The dense state dict from the GGUF; the routed experts load as GGUF expert banks (``freetoken.models.gguf.experts``)."""
+    if not include_non_moe:
+        return
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts, (
-        "gemma4 GGUF stores experts as Q4_0 and only supports the offload backend; "
-        "experts are loaded into the offload cache via load_q4_0_expert_sources()."
-    )
-    assert include_non_moe
     _require_tp1("weight loading")
-
-    # Full-attention layers ship no attn_v (k reused as v); SWA layers do. Knowing which
-    # is which lets us emit the fused qkv as soon as its parts are present.
     config = parse_gguf_config(cached_load_hf_config(model_path))
-    k_eq_v_layers = {
-        lid
-        for lid in range(config.num_layers)
-        if isinstance(config.attention_group_for_layer(lid), FullAttentionGroupConfig)
-        and config.attention_group_for_layer(lid).k_eq_v
-    }
+    vision = include_vision and config.is_multimodal
+    log_mmproj(model_path, vision)
+    index = gguf_tensor_index(model_path)
+    hidden = config.hidden_size
 
-    # Per-layer fusion buffers: layer -> {slot: packed[out, row_bytes]}.
-    qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
-    gate_up_buf: dict[int, dict[str, torch.Tensor]] = {}
+    def t(name: str):
+        return index[name if name in index else f"{name}.weight"]
 
-    def layer_of(name: str) -> int:
-        return int(name.split(".")[1])
+    embed = t("token_embd")
+    yield from fused("model.embed_tokens", [embed], [matrix(embed)], hidden)
+    if "output.weight" in index:
+        out = t("output")
+        yield from fused("lm_head", [out], [matrix(out)], hidden)
+    yield "model.norm.weight", float_tensor(t("output_norm"))
 
-    for t in iter_gguf_tensors(model_path):
-        name = t.name
-        if name == "token_embd.weight":
-            yield "model.embed_tokens.qweight", t.packed()  # Q6_K packed table
-            continue
-        if name == "output_norm.weight":
-            yield "model.norm.weight", _to_bf16(t)
-            continue
-        if name == "rope_freqs.weight":
-            continue  # rope frequencies recomputed in-engine
-        if not name.startswith("blk."):
-            continue
-        if any(name.endswith(sfx) for sfx in _EXPERT_SUFFIXES):
-            continue  # routed experts -> offload banks
+    e_args = config.gemma4_e_args
+    if e_args is not None:
+        table, projection = t("per_layer_token_embd"), t("per_layer_model_proj")
+        yield from fused("model.embed_tokens_per_layer", [table], [table_matrix(table)], int(table.ne[0]))
+        yield from fused("model.per_layer_model_projection", [projection], [matrix(projection)], hidden)
+        yield "model.per_layer_projection_norm.weight", float_tensor(t("per_layer_proj_norm"))
 
-        layer = layer_of(name)
-        suffix = name.split(".", 2)[2]  # after "blk.N."
-        base = f"model.layers.{layer}"
-
-        if suffix in _LAYER_SCALAR_MAP:
-            rel = _LAYER_SCALAR_MAP[suffix]
-            tensor = _to_bf16(t)
-            if rel.endswith("layer_scalar"):
-                tensor = tensor.reshape(1)
-            yield f"{base}.{rel}", tensor
-            continue
-
-        # Quantized projections: keep packed; fuse q/k/v and gate/up.
-        if suffix == "attn_q.weight":
-            qkv_buf.setdefault(layer, {})["q"] = t.packed()
-        elif suffix == "attn_k.weight":
-            qkv_buf.setdefault(layer, {})["k"] = t.packed()
-        elif suffix == "attn_v.weight":
-            qkv_buf.setdefault(layer, {})["v"] = t.packed()
-        elif suffix == "ffn_gate.weight":
-            gate_up_buf.setdefault(layer, {})["gate"] = t.packed()
-        elif suffix == "ffn_up.weight":
-            gate_up_buf.setdefault(layer, {})["up"] = t.packed()
-        elif suffix == "attn_output.weight":
-            yield f"{base}.self_attn.o_proj.qweight", t.packed()
-        elif suffix == "ffn_down.weight":
-            yield f"{base}.feed_forward.shared_mlp.down_proj.qweight", t.packed()
+    scalar_map = {**_LAYER_SCALAR_MAP, **_MOE_LAYER_SCALAR_MAP} if config.moe_enabled else dict(_LAYER_SCALAR_MAP)
+    if e_args is not None:
+        scalar_map.update(_PER_LAYER_SCALAR_MAP)
+    for layer in range(config.num_layers):
+        blk, base = f"blk.{layer}", f"model.layers.{layer}"
+        kv_shared = e_args is not None and e_args.is_kv_shared(layer)
+        for suffix, rel in scalar_map.items():
+            # a KV-shared layer has no k_norm, whether or not the file still ships one
+            if kv_shared and suffix == "attn_k_norm.weight":
+                continue
+            tensor = float_tensor(index[f"{blk}.{suffix}"])
+            if suffix == "ffn_down_exps.scale" and weight_scale(index[f"{blk}.ffn_down_exps.weight"]) is not None:
+                # the converter folds per_expert_scale into the NVFP4 down weight_scale_2, which the expert kernel applies
+                tensor = torch.ones_like(tensor)
+            yield f"{base}.{rel}", tensor.reshape(1) if rel.endswith("layer_scalar") else tensor
+        if kv_shared and f"{blk}.attn_qkv.weight" in index:
+            # --fuse-qkv fuses a KV-shared layer too (the HF checkpoint still ships its k and v):
+            # q is the leading rows, as llama.cpp reads it, and the rest go unread
+            qkv = t(f"{blk}.attn_qkv")
+            q_rows = config.num_qo_heads * config.attention_group_for_layer(layer).head_dim
+            yield from fused(f"{base}.self_attn.q_proj", [qkv], [matrix(qkv)[:q_rows]], hidden)
+        elif kv_shared:
+            q = t(f"{blk}.attn_q")
+            yield from fused(f"{base}.self_attn.q_proj", [q], [matrix(q)], hidden)
         else:
-            raise ValueError(f"unmapped gemma4 GGUF tensor: {name}")
-
-        # Emit fused qkv once all parts are present: k_eq_v full layers reuse k as v
-        # (no attn_v tensor), SWA layers wait for their separate attn_v.
-        slots = qkv_buf.get(layer)
-        if slots is not None and "q" in slots and "k" in slots:
-            if layer in k_eq_v_layers:
-                v = slots["k"]
-            elif "v" in slots:
-                v = slots["v"]
+            if f"{blk}.attn_qkv.weight" in index:
+                # convert_hf_to_gguf.py --fuse-qkv stores q, k and v as one attn_qkv matrix
+                qkv = [t(f"{blk}.attn_qkv")]
             else:
-                v = None
-            if v is not None:
-                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                    [slots["q"], slots["k"], v], dim=0
-                )
-                del qkv_buf[layer]
-        gu = gate_up_buf.get(layer)
-        if gu is not None and "gate" in gu and "up" in gu:
-            yield f"{base}.feed_forward.shared_mlp.gate_up_proj.qweight", torch.cat(
-                [gu["gate"], gu["up"]], dim=0
-            )
-            del gate_up_buf[layer]
+                q, k = t(f"{blk}.attn_q"), t(f"{blk}.attn_k")
+                qkv = [q, k, index.get(f"{blk}.attn_v.weight", k)]
+            yield from fused(f"{base}.self_attn.qkv_proj", qkv, [matrix(p) for p in qkv], hidden)
+        o = t(f"{blk}.attn_output")
+        yield from fused(f"{base}.self_attn.o_proj", [o], [matrix(o)], int(o.ne[0]))
+        gate, up, down = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
+        yield from fused(f"{base}.feed_forward.shared_mlp.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], hidden)
+        yield from fused(f"{base}.feed_forward.shared_mlp.down_proj", [down], [matrix(down)], int(down.ne[0]))
+        if e_args is not None:
+            gate, proj = t(f"{blk}.inp_gate"), t(f"{blk}.proj")
+            yield from fused(f"{base}.per_layer_input_gate", [gate], [matrix(gate)], hidden)
+            yield from fused(f"{base}.per_layer_projection", [proj], [matrix(proj)], int(proj.ne[0]))
 
-    assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
-    assert not gate_up_buf, f"incomplete gate_up groups: {sorted(gate_up_buf)}"
+    if vision:
+        yield from iter_mmproj_weights(find_mmproj(model_path))
 
 
 # --------------------------------------------------------------------------------------
-# Model layer swap: dense bf16 Linear/Embedding -> native GGUF-quant ops.
+# MTP draft: the gemma4-assistant sidecar (gemma4-assistant.cpp), four KV-shared decoder
+# layers that read the target's cache and store nothing, plus its own tied vocab table.
 # --------------------------------------------------------------------------------------
 
+ASSISTANT_ARCH = "gemma4-assistant"
 
-def is_gguf_model(config: ModelConfig) -> bool:
-    """True when the model was parsed from a GGUF checkpoint (native-quant path)."""
-    return getattr(config, "moe_weight_format", None) == "q4_0"
-
-
-class GGUFTiedLMHead:
-    """Tied LM head over a native Q6_K embedding table (logits via ggml matmul).
-
-    Holds only a reference to the GGUF embedding (no params of its own -> empty
-    state_dict), mirroring ``ParallelLMHead`` with ``tie_word_embeddings``. TP=1 only.
-    """
-
-    def __init__(self, embedding, quant_type: int):
-        self._embedding = embedding
-        self._quant_type = quant_type
-
-    def state_dict(self, *, prefix: str = "", result=None):
-        return result if result is not None else {}
-
-    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
-        state_dict.pop(f"{prefix}.weight", None)
-        state_dict.pop(f"{prefix}.bias", None)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.core import get_global_ctx
-        from freetoken.layers.gguf import fused_mul_mat_gguf
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return fused_mul_mat_gguf(x, self._embedding.qweight, self._quant_type)
+_ASSISTANT_LEAVES = {
+    "self_attn.q_proj": "attn_q",
+    "self_attn.o_proj": "attn_output",
+    "feed_forward.shared_mlp.gate_proj": "ffn_gate",
+    "feed_forward.shared_mlp.up_proj": "ffn_up",
+    "feed_forward.shared_mlp.down_proj": "ffn_down",
+}
+_ASSISTANT_LAYER_RE = re.compile(r"^layers\.(\d+)\.(.+)$")
 
 
-def convert_gemma4_to_gguf(model, config: ModelConfig) -> None:
-    """In place: replace gemma4's dense projections + embedding with native GGUF ops.
+def to_gguf_assistant(name: str, tensors: dict[str, int]) -> tuple[str, ...]:
+    """Draft module name -> sidecar tensor. The draft has no k or v (it reads the target's) and its tied head has no tensor of its own."""
+    if name == "vocab":
+        return ("token_embd",)
+    if name == "lm_head":
+        return ()
+    if name in ("pre_projection", "post_projection"):
+        return (f"nextn.{name}",)
+    m = _ASSISTANT_LAYER_RE.match(name)
+    if m is None:
+        return ()
+    leaf = _ASSISTANT_LEAVES.get(m.group(2))
+    return (f"blk.{m.group(1)}.{leaf}",) if leaf is not None else ()
 
-    Quantized in the checkpoint -> swapped: attention qkv/o, shared-MLP gate_up/down
-    (all Q4_0) and the token embedding (Q6_K, also the tied LM head). Left as dense
-    bf16 (F32 in the GGUF): the router gate, all RMSNorms, the per-layer scalars, and
-    the routed experts (served from the offload cache).
-    """
-    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
 
-    def swap_linear(owner, attr, quant_type=GGML_Q4_0):
-        lin = getattr(owner, attr)
-        out_features, in_features = lin.weight.shape
-        setattr(
-            owner,
-            attr,
-            GGUFLinear(in_features, out_features, quant_type, has_bias=lin.bias is not None),
+def assistant_quant(model_path: str) -> "GGUFConfig":
+    """The draft's quant over the sidecar's own tensor table: its matrices and its F32 norms live in the same file."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap
+
+    types = {name: info.ggml_type for name, info in gguf_tensor_index(model_path).items()}
+    return GGUFConfig(types, to_gguf_assistant, name_map=NameMap(packed=(("gate_up_proj", ("gate_proj", "up_proj")),)))
+
+
+def assistant_config(model_path: str) -> ModelConfig:
+    """The geometry the sidecar describes for itself: draft-width layers, sliding window x3 plus one full partial-rotary layer, all KV-shared."""
+    if gguf_architecture(model_path) != ASSISTANT_ARCH:
+        raise ValueError(f"{model_path}: a gemma4 MTP draft is a {ASSISTANT_ARCH} GGUF, not {gguf_architecture(model_path)!r}")
+    m = load_gguf_metadata(model_path)
+
+    def g(key: str):
+        val = m.get(f"{ASSISTANT_ARCH}.{key}")
+        if val is None:
+            raise KeyError(f"missing GGUF metadata key {ASSISTANT_ARCH}.{key}")
+        return val
+
+    num_layers = int(g("block_count"))
+    swa_pattern = [bool(x) for x in g("attention.sliding_window_pattern")]
+    assert len(swa_pattern) == num_layers, "sliding_window_pattern length != block_count"
+    swa_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if is_swa)
+    full_layer_ids = tuple(i for i, is_swa in enumerate(swa_pattern) if not is_swa)
+    if not full_layer_ids or not swa_layer_ids:
+        raise ValueError(
+            f"{model_path}: attention.sliding_window_pattern must name at least one full and one sliding-window layer"
         )
+    kv_per_layer = g("attention.head_count_kv")
+    if not isinstance(kv_per_layer, (list, tuple)):
+        kv_per_layer = [kv_per_layer] * num_layers
+    ffn = g("feed_forward_length")
+    if isinstance(ffn, (list, tuple)):
+        if len({int(x) for x in ffn}) != 1:
+            raise NotImplementedError(f"{model_path}: per-layer draft MLP widths are not supported")
+        ffn = int(ffn[0])
+    if int(m.get(f"{ASSISTANT_ARCH}.embedding_length_per_layer_input", 0)):
+        raise NotImplementedError(f"{model_path}: an assistant with per-layer inputs is not supported")
 
-    inner = model.model
-    embed = GGUFEmbedding(
-        num_embeddings=config.vocab_size,
-        embedding_dim=config.hidden_size,
-        quant_type=GGML_Q6_K,
-        embed_scale=config.embedding_scale,
+    full_head_dim = int(g("attention.key_length"))
+    if int(g("attention.value_length")) != full_head_dim:
+        raise ValueError(f"{model_path}: the assistant requires key_length == value_length")
+    swa_head_dim = int(g("attention.key_length_swa"))
+    if int(g("attention.value_length_swa")) != swa_head_dim:
+        raise ValueError(f"{model_path}: the assistant requires key_length_swa == value_length_swa")
+
+    max_pos = int(g("context_length"))
+    index = gguf_tensor_index(model_path)
+    if "rope_freqs.weight" not in index:
+        raise ValueError(f"{model_path}: no rope_freqs.weight to size the full layer's partial rotary")
+    # the same divisor tensor as the target's full layer: [1.0] * n_rot/2 + [1e30] * rest (see _full_rotary_dim)
+    full_rotary = RotaryConfig(
+        head_dim=full_head_dim,
+        rotary_dim=int((float_tensor(index["rope_freqs.weight"]) == 1.0).sum().item()) * 2,
+        max_position=max_pos,
+        base=float(g("rope.freq_base")),
+        scaling={"rope_type": "proportional"},
     )
-    inner.embed_tokens = embed
+    swa_rotary = RotaryConfig(
+        head_dim=swa_head_dim,
+        rotary_dim=int(g("rope.dimension_count_swa")),
+        max_position=max_pos,
+        base=float(g("rope.freq_base_swa")),
+        scaling=None,
+    )
 
-    for layer in inner.layers.op_list:
-        swap_linear(layer.self_attn, "qkv_proj")
-        swap_linear(layer.self_attn, "o_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "gate_up_proj")
-        swap_linear(layer.feed_forward.shared_mlp, "down_proj")
+    return ModelConfig(
+        num_layers=num_layers,
+        num_qo_heads=int(g("attention.head_count")),
+        num_kv_heads=int(kv_per_layer[full_layer_ids[0]]),
+        head_dim=full_head_dim,
+        hidden_size=int(g("embedding_length")),
+        vocab_size=int(index["token_embd.weight"].ne[1]),
+        intermediate_size=ffn,
+        hidden_act="gelu_tanh",
+        rms_norm_eps=float(g("attention.layer_norm_rms_epsilon")),
+        tie_word_embeddings=True,
+        rotary_config=full_rotary,
+        num_experts=0,
+        num_experts_per_tok=0,
+        moe_intermediate_size=0,
+        norm_topk_prob=True,
+        model_type="gemma4",
+        architectures=["Gemma4AssistantForCausalLM"],
+        moe_enabled=False,
+        expert_quant="none",
+        use_qk_norm=True,
+        attn_sm_scale=1.0,
+        # the assistant's graph caps nothing: no final_logit_softcapping metadata in any release
+        final_logit_softcapping=None,
+        # its tied table only ever serves logits; input embeddings are the target's, already sqrt-scaled
+        embedding_scale=None,
+        # its own e_args: width 0 (no per-layer inputs), every layer KV-shared from the first
+        gemma4_e_args=Gemma4EArgs(
+            per_layer_hidden_size=0, per_layer_vocab_size=0, first_kv_shared_layer=0, kv_shared_intermediate_size=ffn
+        ),
+        attention_groups=(
+            FullAttentionGroupConfig(
+                name="full",
+                layer_ids=full_layer_ids,
+                num_kv_heads=int(kv_per_layer[full_layer_ids[0]]),
+                head_dim=full_head_dim,
+                rotary_config=full_rotary,
+            ),
+            SWAAttentionGroupConfig(
+                name="swa",
+                layer_ids=swa_layer_ids,
+                num_kv_heads=int(kv_per_layer[swa_layer_ids[0]]),
+                head_dim=swa_head_dim,
+                rotary_config=swa_rotary,
+                sliding_window=int(g("attention.sliding_window")),
+            ),
+        ),
+    )
 
-    if config.tie_word_embeddings:
-        model.lm_head = GGUFTiedLMHead(embed, GGML_Q6_K)
 
+def iter_assistant_weights(model_path: str, config: ModelConfig) -> Iterator[tuple[str, torch.Tensor]]:
+    """The sidecar as ``Gemma4MTPDraft`` names its state dict, gate/up fused as the target's loader does.
 
-# --------------------------------------------------------------------------------------
-# Routed-expert host banks (native Q4_0) for the offload cache.
-# --------------------------------------------------------------------------------------
-
-def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-    E = config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    return {
-        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
-        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
-    }
-
-
-def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
-) -> dict[str, list[torch.Tensor]]:
-    """Per-layer host banks of the routed experts' native Q4_0 block bytes.
-
-    ``gate_up`` is one ``[E, 2I, H//32*18]`` tensor per layer and ``down`` one
-    ``[E, H, I//32*18]`` per layer (independent :class:`HostBank` allocations) -- each
-    expert's packed rows verbatim from the GGUF (no dequant), whole layers arriving in
-    one shot (gate_up + down = 2 writes/layer), so the offload cache streams whole
-    experts to the ggml MoE kernels.
-
-    ``layer_sink=None`` (serving): pin each layer's two banks as they complete via an
-    internally-owned :class:`PinPipeline` (or, on a CUDA-less host, allocate the mmap
-    banks but never pin -- the CPU executor reads them pageable). ``layer_sink`` given
-    (converter): the completion tracker fires into it instead -- nothing here is pinned,
-    and the sink may release banks it has written out, so the returned tensors are only
-    valid until then (the caller owns that tradeoff).
+    Norms read verbatim: gemma4 checkpoints store the norm's final scale (llama.cpp's
+    ``Gemma4Model.norm_shift`` is 0), unlike qwen3.5's zero-centred ones. ``rope_freqs.weight``
+    sizes the full layer's rotary in ``assistant_config`` and is no module's parameter.
     """
-    from freetoken.models.gguf.reader import iter_gguf_tensors
-    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    index = gguf_tensor_index(model_path)
 
-    _require_tp1("expert banks")
-    L, E = config.num_layers, config.num_experts
-    H, I = config.hidden_size, config.moe_intermediate_size
-    h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
-    banks = {name: [b.tensor for b in hb[name]] for name in hb}
-    seen_gu, seen_dn = set(), set()
+    def t(name: str):
+        key = name if name in index else f"{name}.weight"
+        if key not in index:
+            raise ValueError(f"{model_path}: the draft lacks {key}; reconvert with a current llama.cpp")
+        return index[key]
 
-    def _load(sink) -> None:
-        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None  # gate_up + down
-        for t in iter_gguf_tensors(model_path):
-            if not t.name.startswith("blk."):
-                continue
-            layer = int(t.name.split(".")[1])
-            if t.name.endswith("ffn_gate_up_exps.weight"):
-                banks["gate_up"][layer].copy_(t.packed().reshape(E, 2 * I, h_bytes))
-                seen_gu.add(layer)
-            elif t.name.endswith("ffn_down_exps.weight"):
-                banks["down"][layer].copy_(t.packed().reshape(E, H, i_bytes))
-                seen_dn.add(layer)
-            else:
-                continue
-            if tracker is not None:
-                tracker.note(layer)
+    embed = t("token_embd")
+    yield from fused("vocab", [embed], [matrix(embed)], config.hidden_size)
+    for src, dst in (("nextn.pre_projection", "pre_projection"), ("nextn.post_projection", "post_projection")):
+        proj = t(src)
+        yield from fused(dst, [proj], [matrix(proj)], int(proj.ne[0]))
+    yield "norm.weight", float_tensor(t("output_norm"))
 
-    if layer_sink is not None:
-        _load(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _load(pins)
-    else:
-        _load(None)  # CUDA-less: mmap banks stay pageable, never pinned
-
-    want = set(range(L))
-    assert seen_gu == want and seen_dn == want, (
-        f"missing Q4_0 expert layers: gate_up {sorted(want - seen_gu)}, "
-        f"down {sorted(want - seen_dn)}"
-    )
-    return banks
-
-
-def dummy_q4_0_expert_sources(config: ModelConfig) -> dict[str, list[torch.Tensor]]:
-    """Random Q4_0 expert banks shaped like ``load_q4_0_expert_sources`` output."""
-    from freetoken.moe.host_banks import alloc_layer_banks, pin_banks
-
-    L = config.num_layers
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)
-    banks = {name: [b.tensor for b in hb[name]] for name in hb}
-    for t in banks["gate_up"] + banks["down"]:
-        t.random_(0, 256)
-    if torch.cuda.is_available():
-        pin_banks(hb)  # match the other dummies: pin-after-fill (no-op mmap fill on CPU-only)
-    return banks
+    for layer in range(config.num_layers):
+        blk, base = f"blk.{layer}", f"layers.{layer}"
+        sa, ff = f"{base}.self_attn", f"{base}.feed_forward.shared_mlp"
+        q, o = t(f"{blk}.attn_q"), t(f"{blk}.attn_output")
+        yield from fused(f"{sa}.q_proj", [q], [matrix(q)], int(q.ne[0]))
+        yield from fused(f"{sa}.o_proj", [o], [matrix(o)], int(o.ne[0]))
+        gate, up, down = (t(f"{blk}.ffn_{p}") for p in ("gate", "up", "down"))
+        yield from fused(f"{ff}.gate_up_proj", [gate, up], [matrix(gate), matrix(up)], int(gate.ne[0]))
+        yield from fused(f"{ff}.down_proj", [down], [matrix(down)], int(down.ne[0]))
+        yield f"{base}.input_layernorm.weight", float_tensor(t(f"{blk}.attn_norm"))
+        yield f"{sa}.q_norm.weight", float_tensor(t(f"{blk}.attn_q_norm"))
+        yield f"{base}.post_attention_layernorm.weight", float_tensor(t(f"{blk}.post_attention_norm"))
+        yield f"{base}.pre_feedforward_layernorm.weight", float_tensor(t(f"{blk}.ffn_norm"))
+        yield f"{base}.feed_forward.post_feedforward_layernorm.weight", float_tensor(t(f"{blk}.post_ffw_norm"))
+        yield f"{base}.feed_forward.layer_scalar", float_tensor(t(f"{blk}.layer_output_scale")).reshape(1)
 
 
 __all__ = [
+    "ASSISTANT_ARCH",
+    "assistant_config",
+    "assistant_quant",
+    "gguf_mm_config",
+    "iter_assistant_weights",
+    "iter_mmproj_weights",
     "parse_gguf_config",
     "iter_gguf_weights",
-    "convert_gemma4_to_gguf",
-    "is_gguf_model",
-    "load_q4_0_expert_sources",
-    "dummy_q4_0_expert_sources",
+    "to_gguf",
+    "to_gguf_assistant",
 ]

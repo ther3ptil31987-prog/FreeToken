@@ -40,6 +40,9 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     desc="Gemma4 NVFP4 experts",
 )
 _LAYER_INDEX_PATTERN = re.compile(r"layers\.(\d+)\.")
+# the attention leaves that change on a KV-shared layer; the vision tower's layers never match
+_KV_SHARED_LEAF_PATTERN = re.compile(r"^model\.layers\.(?P<layer>\d+)\.self_attn\.(?P<leaf>[qkv]_proj|[kv]_norm)\b")
+_PER_LAYER_TABLE = "model.embed_tokens_per_layer.weight"
 _LAYER_FF_PREFIX_PATTERN = re.compile(r"^(model\.layers\.\d+)\.")
 _MERGE_RULES = {
     ".q_proj": MergeRule(".qkv_proj", "q", ("q", "k", "v")),
@@ -66,15 +69,15 @@ _NVFP4_DENSE_MLP_RE = re.compile(r"\.mlp\.(gate_proj|up_proj|down_proj)\.weight$
 
 
 def _nvfp4_dense_parts(reader: ShardReader, raw_base: str):
-    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp16 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
+    """Load an NVFP4 dense weight as the NVFP4 linear method's buffers: weight uint8 [O, IN//2], weight_scale fp8-e4m3 block [O, IN//16], weight_global fp32 [O] (the per-tensor weight_scale_2 per output row), input_scale fp32 scalar or None when the export has none."""
     w = reader.get_tensor(raw_base + ".weight")
     s = reader.get_tensor(raw_base + ".weight_scale")
-    g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float16)
+    g = reader.get_tensor(raw_base + ".weight_scale_2").reshape(1).to(torch.float32)
     g = g.expand(w.shape[0]).contiguous()
     assert (
         w.dtype is torch.uint8
         and s.dtype is torch.float8_e4m3fn
-        and g.dtype is torch.float16
+        and g.dtype is torch.float32
     ), f"unexpected NVFP4 dense dtypes at {raw_base}: {w.dtype}/{s.dtype}/{g.dtype}"
     a = reader.get_tensor(raw_base + ".input_scale").reshape(()).to(torch.float32) if reader.has(raw_base + ".input_scale") else None
     return w, s, g, a
@@ -180,6 +183,13 @@ def iter_weights(
         if isinstance(config.attention_group_for_layer(layer_id), FullAttentionGroupConfig)
         and config.attention_group_for_layer(layer_id).k_eq_v
     }
+    e_args = config.gemma4_e_args
+
+    def kv_shared_leaf(name: str) -> str | None:
+        """The attention leaf of a KV-shared layer's key, or None for any other key."""
+        m = _KV_SHARED_LEAF_PATTERN.match(name) if e_args is not None else None
+        return m["leaf"] if m is not None and e_args.is_kv_shared(int(m["layer"])) else None
+
     merge_buf: dict[str, dict[str, torch.Tensor]] = {}
     gateup_buf: dict[str, dict[str, tuple]] = {}
     reader = ShardReader(model_path, device)
@@ -196,7 +206,7 @@ def iter_weights(
                         continue
 
                     # Per-expert NVFP4 tensors go to the offload cache (expert pieces),
-                    # not this dense pass; fused bf16/q4_0 experts lack ".experts.<int>." so are unaffected.
+                    # not this dense pass; fused bf16 experts lack ".experts.<int>." so are unaffected.
                     if _NVFP4_EXPERT_RE.search(raw_name):
                         continue
 
@@ -229,8 +239,19 @@ def iter_weights(
                         )
                         continue
 
+                    # a KV-shared layer reuses another layer's k and v: the checkpoint still ships its own, which nothing reads
+                    leaf = kv_shared_leaf(name)
+                    if leaf not in (None, "q_proj"):
+                        continue
+
+                    # the largest tensor in the file; read to host so --embed-weights host never touches VRAM for it
+                    if name == _PER_LAYER_TABLE:
+                        with safetensors.safe_open(file, framework="pt", device="cpu") as host_file:
+                            yield name, host_file.get_tensor(raw_name)
+                        continue
+
                     tensor = f.get_tensor(raw_name)
-                    if is_vision or is_expert:
+                    if is_vision or is_expert or leaf == "q_proj":
                         yield name, tensor
                         continue
 

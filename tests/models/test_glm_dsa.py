@@ -41,7 +41,9 @@ def _hf_indexer(seq: int, topk: int):
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
-    ref_topk = idx(x, q_resid, (cos, sin), None, pos[None])  # [1, S, topk]
+    # bool causal mask, True = visible: since transformers 5.18 the indexer no longer builds one when given None
+    causal = (pos[None, :] <= pos[:, None])[None]
+    ref_topk = idx(x, q_resid, (cos, sin), causal, pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
 
@@ -146,6 +148,87 @@ def test_sparse_kernel_equals_dense_when_all_selected():
     assert (o[0, 0].float() - ref).abs().max().item() < 2e-2
 
 
+def _dequantize(fmt_name, codes, scale):
+    if fmt_name == "fp8_per_token_head":
+        return codes.cpu().view(torch.float8_e4m3fn).float().to(codes.device) * scale
+    return codes.float() * scale
+
+
+@pytest.mark.parametrize("fmt_name", ["fp8_per_token_head", "int8_per_token_head"])
+@pytest.mark.parametrize("force_splits", [0, 4])
+def test_sparse_kernel_reads_quantized_latent_rows(fmt_name, force_splits):
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kernel.triton.kv_rows import store_latent_rows
+    from freetoken.kvcache.format import KV_FORMATS
+
+    torch.manual_seed(0)
+    fmt = KV_FORMATS[fmt_name]
+    h, dv, dr, n = 40, 512, 64, 977
+    capacity = n + 13
+    gain = torch.logspace(-1, 1, n, device="cuda")[:, None]
+    c_kv = (torch.randn(n, dv, device="cuda") * gain).to(torch.bfloat16)
+    # the rope part has a far smaller range than the latent part of the same row, and its own per-row range
+    k_rope = (torch.randn(n, dr, device="cuda") * 0.01 * gain.flip(0)).to(torch.bfloat16)
+    rows = torch.randperm(capacity, device="cuda")[:n].to(torch.int32)
+    pool = torch.zeros(capacity, dv + dr, device="cuda", dtype=fmt.elem_store_dtype)
+    scale = torch.zeros(capacity, 2, device="cuda", dtype=fmt.scale_store_dtype)
+    store_latent_rows(fmt, c_kv, k_rope, rows, pool, scale)
+
+    live = rows.long()
+    latent = _dequantize(fmt_name, pool[live, :dv], scale[live, 0][:, None])
+    rope = _dequantize(fmt_name, pool[live, dv:], scale[live, 1][:, None])
+    torch.testing.assert_close(latent.abs().amax(-1), c_kv.float().abs().amax(-1), rtol=1e-5, atol=0.0)
+    torch.testing.assert_close(rope.abs().amax(-1), k_rope.float().abs().amax(-1), rtol=1e-5, atol=0.0)
+
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    # a large rope query keeps the small rope keys in the logits, so a wrong kpe scale moves the output
+    q[..., dv:] *= 500
+    sm_scale = (dv + dr) ** -0.5
+    idx = torch.full((1, 1, 2048), -1, device="cuda", dtype=torch.int32)
+    idx[0, 0, :n] = rows
+    cnt = torch.tensor([[n]], device="cuda", dtype=torch.int32)
+    o = glm_dsa_sparse_attn(q, pool, idx, sm_scale, counts=cnt, force_splits=force_splits, kv_format=fmt, scale=scale)
+
+    keys = torch.cat([latent, rope], dim=-1)
+    ref = ((q[0, 0].float() @ keys.T) * sm_scale).softmax(-1) @ latent
+    torch.testing.assert_close(o[0, 0].float(), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-2)
+
+
+@pytest.mark.parametrize("force_splits", [0, 4])
+def test_sparse_kernel_reads_latent_rows_past_int32_offsets(force_splits):
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+    from freetoken.kernel.triton.kv_rows import store_latent_rows
+    from freetoken.kvcache.format import INT8_PER_TOKEN_HEAD as fmt
+
+    torch.manual_seed(0)
+    h, dv, dr, n = 16, 512, 64, 64
+    high = (1 << 31) // (dv + dr) + 128
+    required = (high + n) * (dv + dr + 2 * fmt.scale_store_dtype.itemsize)
+    if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < required + (1 << 30):
+            pytest.skip("High-row DSA regression needs 3.2 GiB of free GPU memory")
+
+    # an int32 row offset wraps into the zeroed low rows and fails numerically
+    pool = torch.zeros(high + n, dv + dr, device="cuda", dtype=fmt.elem_store_dtype)
+    scale = torch.zeros(high + n, 2, device="cuda", dtype=fmt.scale_store_dtype)
+    rows = torch.arange(high, high + n, device="cuda", dtype=torch.int32)
+    c_kv = torch.randn(n, dv, device="cuda", dtype=torch.bfloat16)
+    k_rope = torch.randn(n, dr, device="cuda", dtype=torch.bfloat16)
+    store_latent_rows(fmt, c_kv, k_rope, rows, pool, scale)
+    latent = _dequantize(fmt.name, pool[high:, :dv], scale[high:, 0][:, None])
+    rope = _dequantize(fmt.name, pool[high:, dv:], scale[high:, 1][:, None])
+
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    sm_scale = (dv + dr) ** -0.5
+    idx = rows.view(1, 1, n)
+    o = glm_dsa_sparse_attn(q, pool, idx, sm_scale, force_splits=force_splits, kv_format=fmt, scale=scale)
+
+    keys = torch.cat([latent, rope], dim=-1)
+    ref = ((q[0, 0].float() @ keys.T) * sm_scale).softmax(-1) @ latent
+    torch.testing.assert_close(o[0, 0].float(), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-2)
+
+
 def test_identity_selection_equals_topk_selection_at_short_kv():
     """The dense regimes serve through IDENTITY selection (one shared row list,
     stride-0 broadcast, causal counts). At kv <= index_topk the DSA select picks
@@ -223,6 +306,72 @@ def test_splitk_matches_single_program():
     o_single = glm_dsa_sparse_attn(q, pool, idx, 0.07, counts=cnt, force_splits=0)
     o_split = glm_dsa_sparse_attn(q, pool, idx, 0.07, counts=cnt, force_splits=16)
     assert (o_single.float() - o_split.float()).abs().max().item() < 1e-2
+
+
+@pytest.mark.parametrize("dr", [64, 0])
+def test_strided_q_and_out_slice_write(dr):
+    """The glm5_next NoPE plumbing hands the kernel a TRANSPOSED bmm output view as
+    q (no [T, H, d] contiguous copy) and writes the result into a slice of the
+    [T, H, d_v] prefill workspace (out=). Both must reproduce the contiguous-q /
+    fresh-allocation path exactly: same kernel, same inputs, only strides differ.
+    dr = 0 pins the NoPE compile variant glm5_next runs; dr = 64 the roped one."""
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+
+    torch.manual_seed(4)
+    h, dv, n, m = 8, 64, 300, 6
+    pool = torch.randn(n + 20, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    rows = torch.randperm(n + 20, device="cuda")[:n].to(torch.int32)
+    q_mat = torch.randn(h, m, dv + dr, device="cuda", dtype=torch.bfloat16)  # bmm-style [H, m, d]
+    q_strided = q_mat.transpose(0, 1)  # [m, h, d] view -- what mla_forward receives
+
+    idx = torch.full((1, 1, n), -1, device="cuda", dtype=torch.int32)
+    idx[0, 0] = rows
+    pos = torch.arange(n - m, n, device="cuda")
+    cnt = (pos + 1).to(torch.int32).view(1, m)
+    scale = (dv + dr) ** -0.5
+
+    o_ref = glm_dsa_sparse_attn(
+        q_strided.contiguous().unsqueeze(0), pool, idx, scale, counts=cnt, d_v=dv,
+    )
+
+    ws = torch.full((64, h, dv), float("nan"), device="cuda", dtype=torch.bfloat16)
+    glm_dsa_sparse_attn(
+        q_strided.unsqueeze(0), pool, idx, scale, counts=cnt, d_v=dv,
+        out=ws[10 : 10 + m].view(1, m, h, dv),
+    )
+    assert torch.equal(ws[10 : 10 + m], o_ref[0]), "strided q / slice out != contiguous path"
+    assert torch.isnan(ws[:10]).all() and torch.isnan(ws[10 + m :]).all(), \
+        "kernel wrote outside the out= slice"
+
+
+@pytest.mark.parametrize("dr", [64, 0])
+def test_splitk_writes_out_slice(dr):
+    """An m == 1 prefill (a radix-hit prompt) auto-selects split-k; the merge stage
+    must write the merged result into an arbitrary out= slice exactly like the
+    single-program kernel does."""
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+
+    torch.manual_seed(6)
+    h, dv, n = 8, 64, 300
+    pool = torch.randn(n + 20, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    rows = torch.randperm(n + 20, device="cuda")[:n].to(torch.int32)
+    q_mat = torch.randn(h, 1, dv + dr, device="cuda", dtype=torch.bfloat16)
+    q = q_mat.transpose(0, 1).unsqueeze(0)  # [1, 1, h, d] strided view
+    idx = rows.view(1, 1, n)
+    cnt = torch.tensor([[n]], device="cuda", dtype=torch.int32)
+    scale = (dv + dr) ** -0.5
+
+    o_ref = glm_dsa_sparse_attn(
+        q.contiguous(), pool, idx, scale, counts=cnt, d_v=dv, force_splits=4,
+    )
+    ws = torch.full((4, h, dv), float("nan"), device="cuda", dtype=torch.bfloat16)
+    glm_dsa_sparse_attn(
+        q, pool, idx, scale, counts=cnt, d_v=dv, force_splits=4,
+        out=ws[2:3].view(1, 1, h, dv),
+    )
+    assert torch.equal(ws[2], o_ref[0, 0]), "split-k merge into out= slice != reference"
+    assert torch.isnan(ws[:2]).all() and torch.isnan(ws[3:]).all(), \
+        "split-k wrote outside the out= slice"
 
 
 def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64, pages=400):

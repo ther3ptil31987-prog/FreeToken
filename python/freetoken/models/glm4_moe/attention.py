@@ -3,11 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, RMSNorm
+from freetoken.layers import BaseOP, LinearReplicated, RMSNorm
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
-
-from .df11_linear import LinearDF11
 
 if TYPE_CHECKING:
     import torch
@@ -22,14 +20,9 @@ class Glm4MoeAttention(BaseOP):
     - separate q/k/v projections with bias, bias-free o_proj;
     - per-head qk-norm (RMSNorm over ``head_dim``) applied before RoPE;
     - partial RoPE (NeoX half-rotation over the first ``rotary_dim`` dims).
-
-    The projections are lossless DF11 (:class:`LinearDF11`): NVIDIA's NVFP4 recipe keeps
-    every ``self_attn`` out of quantization (qkvo stay bf16), so we reproduce that exactly by
-    storing the bf16 weights compressed (~10.7 bits/weight) and decoding them bit-for-bit in
-    the forward. This fits a 32 GB VRAM target without the accuracy loss fp8 attention would add.
     """
 
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_qo_heads = config.num_qo_heads
@@ -38,10 +31,11 @@ class Glm4MoeAttention(BaseOP):
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.head_dim = head_dim
 
-        self.q_proj = LinearDF11(config.hidden_size, self.qo_attn_dim, has_bias=config.has_attn_bias)
-        self.k_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
-        self.v_proj = LinearDF11(config.hidden_size, self.kv_attn_dim, has_bias=config.has_attn_bias)
-        self.o_proj = LinearDF11(self.qo_attn_dim, config.hidden_size, has_bias=False)
+        quant, bias = config.quant, config.has_attn_bias
+        self.q_proj = LinearReplicated(config.hidden_size, self.qo_attn_dim, bias, quant_config=quant, prefix=f"{prefix}.q_proj")
+        self.k_proj = LinearReplicated(config.hidden_size, self.kv_attn_dim, bias, quant_config=quant, prefix=f"{prefix}.k_proj")
+        self.v_proj = LinearReplicated(config.hidden_size, self.kv_attn_dim, bias, quant_config=quant, prefix=f"{prefix}.v_proj")
+        self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, False, quant_config=quant, prefix=f"{prefix}.o_proj")
 
         if config.use_qk_norm:
             self.q_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)

@@ -24,6 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
+from .config import PLE_NGRAM_STATE
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
@@ -37,10 +38,10 @@ if TYPE_CHECKING:
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
-    from .gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet
 
     g = config.linear_attention_group()
-    return Qwen4ExpGatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
         num_v_heads=g.num_value_heads,
@@ -52,6 +53,7 @@ def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseO
         output_gate=g.output_gate,
         quant_config=config.quant,
         prefix=prefix,
+        out_heads_tiled=config.qwen4_args.gdn_out_heads_tiled,
     )
 
 
@@ -92,6 +94,8 @@ class Qwen4ExpModel(BaseOP):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
+            quant_config=config.quant,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.layers = OPList(
             [
@@ -118,12 +122,22 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
             for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
                 ple.start_prefetch(batch, meta)
-        for layer in self.layers.op_list:
+        features = batch.features
+        wanted = features.wanted_layers if features is not None else ()
+        for i, layer in enumerate(self.layers.op_list):
             hidden = layer.forward(hidden, batch)
-        if meta is not None:
+            if i in wanted:
+                features.layer_output(i, hidden, num_streams=self.hc_count)
+        if meta is not None and meta.is_verify:
+            # the commit rolls the context by the accepted rows only
+            get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+        elif meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if features is not None:
+            # a draft reads the residual streams before the final mix
+            features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden)[0]
 
 
@@ -168,11 +182,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
 
         if engine_config.ple_backend == "disk":
-            from freetoken.utils import download_hf_weight
-
             from .ple_disk import DiskRowTable, resolve_row_source
 
-            folder = download_hf_weight(engine_config.model_path)
             # one WAIT node per captured graph: the flag protocol supports a single consume
             assert len(ple_layers) == 1, "disk PLE backend expects exactly one PLE layer"
             emb, args = ple_layers[0].ple_embedding, ple_layers[0].args
@@ -185,11 +196,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "eos_token_id": args.ngram_boundary_token_id,
                 "image_token_id": args.image_token_id,
             }
+            rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
-                resolve_row_source(folder),
+                resolve_row_source(engine_config.model_path),
                 constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
+                # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
+                max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
+                # an eager decode or verify step stages max_running_req * rows tokens, which can exceed a prefill chunk
+                max_eager_tokens=max(engine_config.max_extend_tokens, engine_config.max_running_req * rows),
             )
             self._ple_table = disk_table
             for ple in ple_layers:
@@ -210,7 +224,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        # the model hands its pre-mix streams to batch.features itself
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

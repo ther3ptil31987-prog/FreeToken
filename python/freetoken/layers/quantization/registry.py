@@ -11,6 +11,7 @@ from .scheme import QuantKind
 class LayerKind(Enum):
     LINEAR = "linear"
     MOE = "moe"
+    EMBEDDING = "embedding"
 
     def __str__(self) -> str:
         return self.value
@@ -57,3 +58,8 @@ def method_class(kind: QuantKind, layer_kind: LayerKind) -> type[Any]:
 
 def methods_for(layer_kind: LayerKind) -> dict[QuantKind, type]:
     return {kind: cls for (kind, lk), cls in _METHODS.items() if lk == layer_kind}
+
+
+def online_kinds() -> set[QuantKind]:
+    """The kinds --online-quant can convert bf16 layers to."""
+    return {kind for (kind, _), cls in _METHODS.items() if cls.online}

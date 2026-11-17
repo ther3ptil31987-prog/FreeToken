@@ -203,16 +203,26 @@ def convert_checkpoint(
     # every MoE strategy reads the routed experts from the banks, fused included
     offload = getattr(mc, "is_moe", False)
     include_moe_experts = not offload
-    method = None
+    method = layer_methods = None
     if offload:
-        from freetoken.engine.engine import offload_expert_method
+        from freetoken.engine.engine import offload_expert_methods
         from freetoken.layers import set_rope_device
 
         set_rope_device(dev)
         object.__setattr__(cfg, "moe_strategy", "offload")
-        method = offload_expert_method(cfg)
+        method, layer_methods = offload_expert_methods(cfg)
 
     from freetoken.utils.progress import byte_bar, count_bar
+
+    # a family refuses a source it has no FTW form for before the writer creates out_dir
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        check_source = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_check_source")
+    except (AttributeError, KeyError, ValueError):
+        check_source = None
+    if check_source is not None:
+        check_source(model_path)
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_bank = n_alpha = 0
@@ -220,8 +230,12 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    # an FTW keeps only a GGUF's text metadata, so it cannot build an mmproj tower
+    include_vision = gguf_config_source(model_path) is None
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
+                                              include_moe_experts=include_moe_experts, include_vision=include_vision),
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
@@ -229,8 +243,6 @@ def convert_checkpoint(
         _progress("dense", dense_bytes, 0)
 
     # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
-    from freetoken.models.register import _load_attr, get_model_spec
-
     try:
         side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
     except (AttributeError, KeyError, ValueError):
@@ -239,6 +251,7 @@ def convert_checkpoint(
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
+    layer_quant_formats = None
     num_layers = None
     if offload:
         # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
@@ -247,9 +260,11 @@ def convert_checkpoint(
         names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
         sink = _ConvertSink(writer, names=names)
         banks = load_expert_banks(
-            model_path, mc, method=method, device=dev, dtype=dtype, layer_sink=sink
+            model_path, mc, method=method, device=dev, layer_sink=sink, layer_methods=layer_methods
         )
         quant_format = banks.quant_format
+        layer_quant_formats = banks.layer_formats
+        assert layer_quant_formats is None or banks.streamed, "experts of several formats always stream to the sink"
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
@@ -313,6 +328,9 @@ def convert_checkpoint(
         # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
         # tensor already carries its own dtype, and nothing reads a model-level backend.
         "quant_format": quant_format,
+        # Experts of several formats: each MoE layer's quant_format (quant_format above is the most common). A layer only
+        # stores the banks its kernel reads; the reader gives it zero-byte placeholders for the others.
+        "layer_quant_formats": layer_quant_formats,
         # The reader takes num_layers from the model config (copied into this
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.

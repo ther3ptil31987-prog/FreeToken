@@ -1,12 +1,12 @@
 # Supported models
 
-FreeToken loads HF safetensors checkpoints directly. The checkpoints below are known-good — the prebuilt kernels are tuned
+FreeToken loads HF safetensors checkpoints and llama.cpp [GGUF](#gguf) files directly. The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
 |---|---|
 | DeepSeek-V4.1-Flash | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) |
-| DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) |
+| DeepSeek-V4 | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731), [deepseek-ai/DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) |
 | GLM-5.3-Flash | [RedHatAI/GLM-5.3-Flash-NVFP4](https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4) |
 | GLM-5.2 | [nvidia/GLM-5.2-NVFP4](https://huggingface.co/nvidia/GLM-5.2-NVFP4) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) |
@@ -16,10 +16,35 @@ for them; other checkpoints of the same architectures work too.
 | Qwen3-MoE | [Qwen/Qwen3-30B-A3B](https://huggingface.co/Qwen/Qwen3-30B-A3B) |
 | Qwen3-VL | [Qwen/Qwen3-VL-8B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct), [Qwen/Qwen3-VL-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct) |
 | gpt-oss | [openai/gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b), [openai/gpt-oss-20b](https://huggingface.co/openai/gpt-oss-20b) |
-| Gemma-4 | [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
+| Gemma-4 | [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it), [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it), [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it), [nvidia/Gemma-4-26B-A4B-NVFP4](https://huggingface.co/nvidia/Gemma-4-26B-A4B-NVFP4), [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it), [nvidia/Gemma-4-31B-IT-NVFP4](https://huggingface.co/nvidia/Gemma-4-31B-IT-NVFP4) .. |
 | MiniMax-M2.5 | [nvidia/MiniMax-M2.5-NVFP4](https://huggingface.co/nvidia/MiniMax-M2.5-NVFP4) |
 | MiniMax-M3 | [nvidia/MiniMax-M3-NVFP4](https://huggingface.co/nvidia/MiniMax-M3-NVFP4) |
 | Muse-Glimmer | [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B), [RedHatAI/Muse-Glimmer-30B-NVFP4](https://huggingface.co/RedHatAI/Muse-Glimmer-30B-NVFP4) |
+| Flint | [FutureMLS-Lab/flint-nvfp4-coldgptq](https://huggingface.co/FutureMLS-Lab/flint-nvfp4-coldgptq), [RecursiveSI/flint-nvfp4-gguf](https://huggingface.co/RecursiveSI/flint-nvfp4-gguf) |
+| Ripple-65B Preview | [ricursiveAI/Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview), [ricursiveAI/Ripple-65B-Preview-NVFP4](https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4), [AtomicChat/Ripple-65B-Preview-GGUF](https://huggingface.co/AtomicChat/Ripple-65B-Preview-GGUF) |
+
+### GGUF
+
+`--model` takes a local `.gguf` file; for a split GGUF, pass its first file (`*-00001-of-0000N.gguf`) with the others beside it.
+These llama.cpp architectures (`general.architecture`) are served:
+
+| GGUF architecture | Models |
+|---|---|
+| `qwen35moe`, `qwen35` | Qwen3.5 / Qwen3.6 MoE and dense, Qwen3.8 dense |
+| `qwen4exp` | Qwen3.8-Flash-Next |
+| `qwen3moe`, `qwen3` | Qwen3 MoE and dense |
+| `qwen3vlmoe`, `qwen3vl` | Qwen3-VL |
+| `qwen2` | Qwen2, Qwen2.5 |
+| `llama` | Llama, Mistral |
+| `gemma4` | Gemma-4 |
+| `glm4moe` | GLM-4.5, GLM-4.6, GLM-4.7 |
+| `glm5-next` | GLM-5.3-Flash |
+| `deepseek4` | DeepSeek-V4 Flash and Pro |
+| `minimax-m2`, `minimax-m3` | MiniMax-M2, MiniMax-M3 |
+| `muse-glimmer` | Muse-Glimmer |
+| `gpt-oss` | gpt-oss |
+| `flint` | Flint |
+| `ricursive` | Ripple-65B Preview |
 
 ### Image input
 
@@ -35,31 +60,59 @@ These families accept image input by default; pass `--text-model-only` to skip t
 | GLM-5.3-Flash (`glm5_next`: ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution on a canvas zero-padded to a 28-multiple | token counts, passed through as the processor's `min_image_tokens` / `max_image_tokens`; checkpoint defaults 16 to 8000 tokens | `{"max_image_tokens": 2048}` |
 | Muse-Glimmer-30B (windowed ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, aspect ratio kept under a token cap; checkpoint default 4096 tokens | the maximum is the cap (`max_image_tokens`); the minimum has no effect | `{"max_image_tokens": 1024}` |
 | MiniMax-M3 (`minimax_m3`: CLIP-style ViT tower, streamed under `--mm-encoder-weights host`) | one token per 28x28 pixels of the resized image, dynamic resolution | pixel areas in `size.shortest_edge` / `longest_edge`; checkpoint defaults 4 to 576 tokens | `{"size": {"longest_edge": 1048576}}` |
+| DeepSeek-V4-Flash-Vision (`deepseek_v4`: native-resolution ViT tower, streamed under `--mm-encoder-weights host`) | one token per 3x3 grid of 14x14 patches, against a per-image cap; the block carries sentinel tokens and lead pads that align it to a 4-token compression stride, so its length depends on where it lands in the prompt | the maximum is a cap on the block (`vision_max_n_token`, checkpoint default 384) and lowers it, the minimum is read as the checkpoint's upscale floor and has no effect | not read |
+
+A GGUF model takes image input from a separate llama.cpp mmproj file, found in the model file's own folder or passed with `--mmproj` (see the
+[CLI reference](cli.md#image-input)). A GGUF file that carries the vision tensors itself (the Ollama layout) serves text only. The tower runs in bf16
+whatever the mmproj stores; a quantized mmproj is dequantized at load and keeps its quantization error. Image tokens and budgets are those of the
+family's row above.
 
 ## MoE strategies
 
 `ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
 
 - **fused** — experts resident on GPU (needs the VRAM). Serves every expert
-  format except GGUF and DeepSeek-V4's.
+  format except DeepSeek-V4's.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
   misses stream over PCIe.
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
-  CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
+  CPU, overlapped. Run `ft bench bw --model <checkpoint>` once per machine and
+  model to calibrate the split.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
-  `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
-  recommends it. Unified-memory GPUs differ, see below.
+  `offload`. Unified-memory GPUs differ, see below.
 
 ### Unified-memory GPUs (GB10 / DGX Spark)
 
 The GPU and the CPU share one DRAM, so offload only copies experts between two
 names for the same memory. On these GPUs `auto` resolves every MoE model to
-`fused`: the default is the resident path only. GGUF and DeepSeek-V4 experts
+`fused`: the default is the resident path only. DeepSeek-V4 experts
 have no resident path and stay on `offload`. Offload-only flags
 (`--moe-cpu-layers`, `--moe-cache-size` / `-rate` / `-auto`,
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
+
+### Hosts that cap pinned memory (WSL)
+
+WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
+model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
+first, then pins them layer by layer from the middle out until CUDA refuses one;
+the remaining head and tail layers are OS-locked instead (resident, but with no
+device address). After a refusal under WDDM (WSL and native Windows) it
+unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`).
+The probe runs only where pinning is known to be capped (WDDM, or
+`FREETOKEN_SIMULATE_PIN_CAP_GB` for testing). FTW checkpoints, dummy weights
+and models the CPU executor cannot serve take the size estimate instead, as
+does `FREETOKEN_PIN_BUDGET_GB`, which fixes the budget: the locked layers are
+then picked from a size estimate before the load, and a refused pin stops the
+boot.
+
+Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
+step it fetches a share of its misses (`--moe-locked-fetch`, by default from the `ft bench bw` profile): CPU threads
+copy the experts into a small pinned staging buffer
+(`--moe-locked-max-fetch` rows per bank) and the GPU copies them into the
+slots. The CPU computes the remaining misses, as on any hybrid layer. Under
+`offload`, locked layers decode on the CPU.
 
 ### NVLink-C2C hosts (GH200 / GB200)
 
@@ -77,17 +130,42 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
   its experts as dense weights and no longer loads; reconvert it with `ft checkpoint`.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
+- Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
+  when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- GLM-4.7 (`nvidia/GLM-4.7-NVFP4`) serves its attention and input embedding in bf16, as the checkpoint stores
+  them. `--online-quant df11` compresses them losslessly at load, about 8 GiB less VRAM, at the cost of decoding
+  them on every step; builds before the flag always did this. An FTW of GLM-4.7 converted by such a build stores
+  those weights as DF11 and no longer loads; reconvert it with `ft checkpoint`.
+- NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
+  older build) is refused at load; reconvert it with `ft checkpoint`.
+- Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
+  fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
+  already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
+- A DeepSeek-V4 GGUF takes image input from the Vision-Exp text file paired with its
+  `deepseek4v` mmproj; the text-only 0731 release has no image token and refuses the
+  mmproj. ggml-org's Vision-Exp text GGUF ships a chat template that renders no image
+  placeholder; serve unsloth's release for image requests.
+- A DeepSeek-V4.1 GGUF (llama.cpp's `deepseek41` layout, such as
+  [unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF))
+  serves text; its `deepseek41v` mmproj and DSpark draft are not read. The Engram tables
+  stream from the file's `per_layer_token_embd` tensor, so keep that file on a fast NVMe.
+  A build that ships the tables as a separate shard needs it linked next to the others under
+  its shard name, as llama.cpp does. A file converted for an earlier llama.cpp branch has
+  no `ple.layers` key and is refused, and so are unsloth's UD-Q3_K_XL, UD-Q4_K_XL and UD-Q8_K_XL,
+  whose MXFP8 tables only unsloth's llama.cpp PR reads. `ft checkpoint` does not convert these
+  GGUFs: serve the `.gguf`.
 - DeepSeek-V4.1-Flash serves text and images from the HF checkpoint as shipped (fp8 block-32
   dense weights, fp4 experts on the offload cache, 890 B/token global KV in packed
   fp4/fp8 pools). Its two 98 GiB Engram tables stream from the checkpoint shards on
@@ -106,7 +184,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   Bounded output differs from exact by construction and does not depend on the prefill chunk size.
   Under expert offload the prefill time is bounded by streaming each layer's experts, so decoder
   replay saves decoder-layer compute, not prefill time.
-  Run `ft bench bw --model dsv4.1-flash` to measure local PCIe and CPU bandwidth before
+  Run `ft bench bw --model <checkpoint>` to measure local PCIe and CPU bandwidth before
   choosing a MoE strategy; `--moe-strategy hybrid` splits expert misses using those
   measurements. With `--moe-cache-auto`, `--kv-reserve-tokens` sets the token capacity reserved
   before the expert cache is allocated, subject to the attention pool's structural minimum; size it
@@ -119,3 +197,4 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

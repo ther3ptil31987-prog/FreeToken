@@ -31,6 +31,77 @@ def test_shard_tensor_splits_vocab_with_ceil_partition():
     assert rank1.tolist() == value[3:5].tolist()
 
 
+def test_iter_weight_files_reads_shards_from_an_indexed_subdirectory(tmp_path):
+    """FP4-Local releases keep shards in tensors/; the root glob alone finds nothing."""
+    import json
+    import os
+    from freetoken.models.loader import iter_weight_files
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "tensors/model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert len(files) == 2
+    assert all(os.path.exists(f) for f in files)
+
+
+def test_iter_weight_files_lets_the_index_decide_which_shards_load(tmp_path):
+    """The index is authoritative: it may name root and subdirectory shards; an unlisted root file is not loaded."""
+    import json
+    from freetoken.models.loader import iter_weight_files
+
+    root = tmp_path / "model-00001-of-00002.safetensors"
+    root.write_bytes(b"")
+    (tmp_path / "unlisted.safetensors").write_bytes(b"")
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    (sub / "model-00002-of-00002.safetensors").write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                    "lm_head.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+
+    files = iter_weight_files(str(tmp_path))
+
+    assert files == [str(root), str(sub / "model-00002-of-00002.safetensors")]
+
+
+def test_iter_weight_files_falls_back_to_root_shards_without_an_index(tmp_path):
+    """No index: the root glob loads, excluding consolidated.safetensors unless it is the only shard."""
+    from freetoken.models.loader import iter_weight_files
+
+    a = tmp_path / "model-00001-of-00002.safetensors"
+    b = tmp_path / "model-00002-of-00002.safetensors"
+    consolidated = tmp_path / "consolidated.safetensors"
+    for path in (a, b, consolidated):
+        path.write_bytes(b"")
+
+    assert sorted(iter_weight_files(str(tmp_path))) == sorted([str(a), str(b)])
+
+    a.unlink()
+    b.unlink()
+    assert iter_weight_files(str(tmp_path)) == [str(consolidated)]
+
+
 def test_iter_root_safetensor_files_from_index_keeps_only_root_index_shards(tmp_path):
     import json
     from freetoken.models.loader import iter_root_safetensor_files_from_index
@@ -201,3 +272,22 @@ def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
     assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
     with pytest.raises(ValueError, match="Missing MoE expert source layers"):
         list(stacked_expert_pieces(tensors[:3], config))
+
+
+def test_stacked_expert_pieces_skip_the_layers_of_other_formats():
+    from freetoken.moe.expert_pieces import stacked_expert_pieces
+
+    config = SimpleNamespace(num_layers=3, num_experts=2)
+    tensors = [
+        ("model.layers.0.mlp.experts.gate_up_proj", torch.full((2, 3, 4), 2.0)),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight_scale", torch.zeros(3, 1)),
+        ("model.layers.0.mlp.experts.down_proj", torch.full((2, 4, 3), 10.0)),
+        ("model.layers.2.mlp.experts.gate_up_proj", torch.full((2, 3, 4), 3.0)),
+        ("model.layers.2.mlp.experts.down_proj", torch.full((2, 4, 3), 11.0)),
+    ]
+
+    pieces = list(stacked_expert_pieces(tensors, config, layers=[0]))
+
+    assert [(layer, e0, e1) for layer, e0, e1, _ in pieces] == [(0, 0, 2)]
+    with pytest.raises(ValueError, match="Unexpected expert weight key"):
+        list(stacked_expert_pieces(tensors, config))

@@ -9,24 +9,34 @@ import torch.nn.functional as F
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearRowParallel, OffloadMoELayer
+from freetoken.mm import MM_PAD_SHIFT_VALUE
 
 from .args import DeepseekV4Args
 
 
 class Gate(BaseOP):
-    """MoE router: sqrtsoftplus scoring + hash routing (first ``n_hash_layers``)."""
+    """MoE router: sqrtsoftplus scoring + hash routing (first ``n_hash_layers``).
+
+    A vision checkpoint gives every layer a ``bias_vl`` too: the expert-selection bias for
+    image rows, which never touches the routing weights. Hash layers keep routing text rows
+    through ``tid2eid`` and pick image rows by ``(scores + bias_vl).topk``, mirroring the
+    reference ``Gate.forward``.
+    """
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
         self.topk = args.n_activated_experts
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
+        vl = args.vision_n_layers > 0
         self.weight = torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16)
         if self.hash:
             self.tid2eid = torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int64)
-            self.bias = None
+            # present on hash layers of a vision checkpoint, loaded but never applied
+            self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
         else:
             self.bias = torch.empty(args.n_routed_experts, dtype=torch.float32)
+        self.bias_vl = torch.empty(args.n_routed_experts, dtype=torch.float32) if vl else None
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
         scores = bf16_linear_fp32(x, self.weight)
@@ -37,11 +47,20 @@ class Gate(BaseOP):
         else:
             scores = F.softplus(scores).sqrt()
         original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
+        # image rows are the content pad ids of an expanded image span
+        image_mask = input_ids >= MM_PAD_SHIFT_VALUE if self.bias_vl is not None else None
         if self.hash:
-            indices = self.tid2eid[input_ids]
+            if image_mask is None:
+                indices = self.tid2eid[input_ids]
+            else:
+                indices = self.tid2eid[torch.where(image_mask, 0, input_ids)]
+                vl_indices = (scores + self.bias_vl).topk(self.topk, dim=-1)[1]
+                indices = torch.where(image_mask.unsqueeze(-1), vl_indices.to(indices.dtype), indices)
         else:
+            if image_mask is None:
+                scores = scores + self.bias
+            else:
+                scores = scores + torch.where(image_mask.unsqueeze(-1), self.bias_vl, self.bias)
             indices = scores.topk(self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":
@@ -78,7 +97,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_size=args.dim,
             intermediate_size=args.moe_inter_dim,
             renormalize=True,
-            activation="silu",
+            # the clamped SwiGLU the reference runs (up to +-limit, gate to max limit); the
+            # GGUF MoE path keys on this name and plain "silu" would drop the clamp
+            activation="swiglu_clamp",
             limit=args.swiglu_limit,
             strategy=strategy,
             decode_target=decode_target,
@@ -101,8 +122,9 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         cache = self.offload_cache
         assert cache is not None
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
+        # one threshold for all layers (the smallest pool): with overlap prefill, the layers of a chunk must all stream or all take the slot path
         if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
+            hidden_states.shape[0] * self.top_k >= min(self.num_experts, *cache.pool_sizes)
             or cache.is_unpinned_layer(self.layer_id)
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
@@ -115,7 +137,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,

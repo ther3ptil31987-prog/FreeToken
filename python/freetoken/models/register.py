@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -13,6 +13,8 @@ class EncoderSpec:
     kind: str  # "vision" | "audio", the name --mm-disable takes
     config_key: str  # the checkpoint config section that builds the tower
     modalities: tuple[str, ...]  # inputs it serves, as implemented
+    # why a checkpoint's section builds no tower although the family registers one, or None; such a checkpoint serves the other modalities
+    unserved: Callable[[Any], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,8 @@ class ModelSpec:
     # "module:Class" turning the checkpoint's media into items; None: the family takes no multimodal input
     mm_processor: str | None = None
     encoders: tuple[EncoderSpec, ...] = ()
+    # speculative method -> "module:Class" of the family's draft for it
+    spec_drafts: tuple[tuple[str, str], ...] = ()
 
 
 # Multimodal wrappers store the text tower under model.language_model.
@@ -40,6 +44,9 @@ _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_DFLASH2 = ("dflash", "freetoken.models.dflash:DFlash2DraftModel")
+_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"), _DFLASH2)
+_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"), _DFLASH2)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -48,6 +55,8 @@ _DENSE_PACKED = (
 # per-expert checkpoints: probe the first expert's projections for the experts container
 _EXPERTS_PACKED = (("experts", ("experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj")),)
 _EXPERTS_W123_PACKED = (("experts", ("experts.0.w1", "experts.0.w2", "experts.0.w3")),)
+# the GGUF scheme reads expert types in (gate, up, down) order
+_EXPERTS_W132_PACKED = (("experts", ("experts.0.w1", "experts.0.w3", "experts.0.w2")),)
 # pre-stacked expert checkpoints (Qwen3-VL-MoE): the container's own two tensors are the probe
 _STACKED_EXPERTS_PACKED = (("experts", ("experts.gate_up_proj", "experts.down_proj")),)
 _QWEN3_5_PACKED = _DENSE_PACKED + (
@@ -61,6 +70,8 @@ _QWEN3_5_UNQUANTIZED = ("*.mlp.gate", "*.mlp.shared_expert_gate")
 _QWEN4_EXP_PACKED = _QWEN3_5_PACKED + (
     ("input_mix_weight_down_block_inject", ("input_mix_weight_down", "block_inject_weight")),
 )
+# the llama.cpp converter splits the indexer projection into q and k
+_QWEN4_EXP_GGUF_PACKED = _QWEN4_EXP_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),)
 # GLM-5.3-Flash's KDA fuses its six input projections.
 _GLM5_NEXT_PACKED = _EXPERTS_PACKED + (
     ("in_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")),
@@ -76,19 +87,61 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
-_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+_GEMMA4_DRAFTS = (("shared_kv_mtp", "freetoken.models.gemma4.mtp:Gemma4MTPDraft"),)
+
+
+def _gemma4_vision_unserved(section: Any) -> str | None:
+    return "the tower does not apply clipped linears" if getattr(section, "use_clipped_linears", False) else None
+
+
+_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), unserved=_gemma4_vision_unserved),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
     ("index_qk_proj", ("index_q_proj", "index_k_proj")),
 ) + _EXPERTS_W123_PACKED
+_MINIMAX_M3_GGUF_PACKED = _DENSE_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),) + _EXPERTS_W132_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# Ripple's V reads the value residual blend, so it cannot fuse with q and k; the gate stays its own linear as in Muse-Glimmer.
+_RICURSIVE_PACKED = (("qk_proj", ("q_proj", "k_proj")), ("gate_up_proj", ("gate_proj", "up_proj")))
+# DeepSeek-V4's vision dims sit at the top level of the checkpoint config, next to the
+# language model's rather than under a section of their own.
+_DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
+_DSV4_ENCODERS = (EncoderSpec("vision", "vision_n_layers", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "FlintGGUFForCausalLM": ModelSpec(
+        "freetoken.models.flint", "FlintForCausalLM",
+        parse_config="parse_gguf_config", iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        unquantized_modules=("*.mlp.gate",),
+    ),
+    "FlintForCausalLM": ModelSpec(
+        "freetoken.models.flint", "FlintForCausalLM",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        unquantized_modules=("*.mlp.gate",),
+    ),
+    "RicursiveForCausalLM": ModelSpec(
+        "freetoken.models.ricursive", "RicursiveForCausalLM",
+        packed_modules_mapping=_RICURSIVE_PACKED,
+    ),
+    "RicursiveGGUFForCausalLM": ModelSpec(
+        "freetoken.models.ricursive", "RicursiveForCausalLM",
+        parse_config="parse_gguf_config", iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_RICURSIVE_PACKED,
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    # llama.cpp llama GGUF (Llama, Mistral): the llama model classes with every tensor in its packed ggml type
+    "LlamaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.llama",
+        "LlamaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED,
     ),
     "Qwen2ForCausalLM": ModelSpec(
@@ -104,6 +157,28 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Qwen3MoeForCausalLM": ModelSpec(
         "freetoken.models.qwen3_moe",
         "Qwen3MoeForCausalLM",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
+    # llama.cpp qwen2 / qwen3 / qwen3moe GGUF: the same model classes with every tensor in its packed ggml type
+    "Qwen2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen2",
+        "Qwen2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3",
+        "Qwen3ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+    ),
+    "Qwen3MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_moe",
+        "Qwen3MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
     ),
     # Qwen3-VL: the Qwen3 text tower under model.language_model. plus the shared Qwen VL vision tower with DeepStack; the MoE variant ships its experts pre-stacked.
@@ -123,10 +198,38 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_DENSE_PACKED + _STACKED_EXPERTS_PACKED,
     ),
+    # llama.cpp qwen3vl / qwen3vlmoe GGUF: the same model classes with every tensor in
+    # its packed ggml type; a qwen3vl_merger mmproj adds the tower with its DeepStack mergers
+    "Qwen3VLGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+    ),
+    "Qwen3VLMoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_vl",
+        "Qwen3VLMoeForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+    ),
     "MiniMaxM2ForCausalLM": ModelSpec(
         "freetoken.models.minimax_m2",
         "MiniMaxM2ForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W123_PACKED,
+    ),
+    # llama.cpp minimax-m2 GGUF: the same model classes with every tensor in its packed ggml type
+    "MiniMaxM2GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m2",
+        "MiniMaxM2ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_W132_PACKED,
     ),
     # MiniMax-M3 (model_type minimax_m3_vl): multimodal wrapper config (text tower in
     # text_config, weights under language_model.); the CLIP-style tower under vision_tower.
@@ -147,14 +250,46 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "MiniMaxM3ForCausalLM",
         packed_modules_mapping=_MINIMAX_M3_PACKED,
     ),
+    # llama.cpp minimax-m3 GGUF: the same model classes with every tensor in its packed ggml type; a minimax_m3 mmproj adds the vision tower
+    "MiniMaxM3GGUFForCausalLM": ModelSpec(
+        "freetoken.models.minimax_m3",
+        "MiniMaxM3ForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_MINIMAX_M3_GGUF_PACKED,
+        mm_processor=_MINIMAX_M3_PROCESSOR,
+        encoders=_MINIMAX_M3_ENCODERS,
+    ),
     "DeepseekV4ForCausalLM": ModelSpec(
         "freetoken.models.deepseek_v4",
         "DeepseekV4ForCausalLM",
         # the checkpoint has no ``model.`` root
-        checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
+        checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
-        # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
-        unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
+        # the embed, the head, the KV compressors, the indexer's scorer and the vision tower +
+        # aligner ship bf16; the fp8 config has no modules_to_not_convert (patterns match
+        # checkpoint names, like V4.1)
+        unquantized_modules=(
+            "embed", "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj", "vision.*", "aligner.*",
+        ),
+        mm_processor=_DSV4_PROCESSOR,
+        encoders=_DSV4_ENCODERS,
+    ),
+    # llama.cpp deepseek4 GGUF (unsloth DeepSeek-V4-Flash-0731-GGUF and the Vision-Exp
+    # release + its deepseek4v mmproj): the same model classes with every tensor in its
+    # packed ggml type
+    "DeepseekV4GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v4",
+        "DeepseekV4ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        # the GGUF scheme reads expert types in (gate, up, down) order
+        packed_modules_mapping=_EXPERTS_W132_PACKED,
+        # the KV compressors read their weights through a dense bf16 einsum, so the reader
+        # dequantizes them instead of serving the packed ggml rows
+        unquantized_modules=("*.compressor.wkv", "*.compressor.wgate"),
+        mm_processor=_DSV4_PROCESSOR,
+        encoders=_DSV4_ENCODERS,
     ),
     # DeepSeek-V4.1-Flash (model_type deepseek_v41): multimodal wrapper config (text tower in
     # text_config). The checkpoint has no ``model.`` root; the compressors, the indexer's key projection /
@@ -167,8 +302,17 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         checkpoint_roots=(("model.layers", "layers"), ("model.embed", "embed"), ("model.norm", "norm")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
         unquantized_modules=(
-            "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
+            "embed", "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.wk", "*.indexer.weights_proj", "vision.*", "aligner.*",
         ),
+    ),
+    # llama.cpp deepseek41 GGUF (text; unsloth DeepSeek-V4.1-Flash-1017-GGUF): the same model classes with every tensor in its packed ggml type
+    "DeepseekV41GGUFForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_v41",
+        "DeepseekV41ForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        # the GGUF scheme reads expert types in (gate, up, down) order
+        packed_modules_mapping=_EXPERTS_W132_PACKED,
     ),
     "Qwen3_5MoeForConditionalGeneration": ModelSpec(
         "freetoken.models.qwen3_5_moe",
@@ -178,6 +322,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # text-only Qwen3.5 releases: text_config is the top-level config and there is no tower
     "Qwen3_5MoeForCausalLM": ModelSpec(
@@ -185,12 +330,40 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Qwen3_5MoeForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     "Qwen3_5ForCausalLM": ModelSpec(
         "freetoken.models.qwen3_5_moe",
         "Qwen3_5ForCausalLM",
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
+    ),
+    # llama.cpp qwen35 / qwen35moe GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
+    # the MTP draft reads the nextn block llama.cpp keeps after the last decoder layer
+    "Qwen3_5GGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5ForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN3_5_DRAFTS,
+    ),
+    "Qwen3_5MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoeForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN3_5_PACKED,
+        unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.). 36 GDN + 12 QSA
@@ -203,6 +376,19 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         mm_processor=_QWEN_VL_PROCESSOR,
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN4_EXP_PACKED,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
+    ),
+    # llama.cpp qwen4exp GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_QWEN4_EXP_GGUF_PACKED,
+        mm_processor=_QWEN_VL_PROCESSOR,
+        encoders=_QWEN_VL_ENCODERS,
+        spec_drafts=_QWEN4_EXP_DRAFTS,
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
@@ -215,6 +401,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         encoders=_QWEN_VL_ENCODERS,
         packed_modules_mapping=_QWEN3_5_PACKED,
         unquantized_modules=_QWEN3_5_UNQUANTIZED,
+        spec_drafts=_QWEN3_5_DRAFTS,
     ),
     # Muse-Glimmer-30B (model_type muse_glimmer): multimodal wrapper config (text tower in
     # text_config, weights under model.language_model.); the windowed ViT under
@@ -226,10 +413,17 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.muse_glimmer",
         "MuseGlimmerForConditionalGeneration",
         checkpoint_roots=_LANGUAGE_MODEL_ROOT,
-        packed_modules_mapping=(
-            ("qkvg_proj", ("q_proj", "k_proj", "v_proj", "gate_proj")),
-            ("gate_up_proj", ("gate_proj", "up_proj")),
-        ),
+        packed_modules_mapping=_DENSE_PACKED,
+        mm_processor=_MUSE_GLIMMER_PROCESSOR,
+        encoders=_MUSE_GLIMMER_ENCODERS,
+    ),
+    # llama.cpp muse-glimmer GGUF: the same model classes with every tensor in its packed ggml type; a muse-glimmer mmproj adds the vision tower (images only)
+    "MuseGlimmerGGUFForCausalLM": ModelSpec(
+        "freetoken.models.muse_glimmer",
+        "MuseGlimmerForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED,
         mm_processor=_MUSE_GLIMMER_PROCESSOR,
         encoders=_MUSE_GLIMMER_ENCODERS,
     ),
@@ -250,12 +444,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4ForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # the gemma-4-12B "Unified" release (model_type gemma4_unified): the gemma4 decoder with a dense feed-forward and a linear vision embedder in place of the ViT tower; audio is not wired
     "Gemma4UnifiedForConditionalGeneration": ModelSpec(
@@ -266,28 +462,64 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4UnifiedForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
-    # GGUF (native Q4_0/Q6_K) gemma4: same model classes, GGUF config + weight loaders.
+    # llama.cpp gemma4 GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Gemma4GGUFForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
-        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
+        checkpoint_segments=_GEMMA4_SEGMENTS,
+        packed_modules_mapping=_GEMMA4_PACKED,
+        mm_processor=_GEMMA4_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
+    ),
+    # the same text GGUF with a gemma4uv mmproj (12B): the text GGUF does not tell the 12B apart, so build_gguf_shim picks this row from the projector
+    "Gemma4UnifiedGGUFForCausalLM": ModelSpec(
+        "freetoken.models.gemma4",
+        "Gemma4UnifiedForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_segments=_GEMMA4_SEGMENTS,
+        packed_modules_mapping=_GEMMA4_PACKED,
+        mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
+        encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
         packed_modules_mapping=_DENSE_PACKED,
     ),
+    # llama.cpp gpt-oss GGUF (gpt-oss-20b / 120b): the same model classes with every
+    # tensor in its packed ggml type
+    "GptOssGGUFForCausalLM": ModelSpec(
+        "freetoken.models.gpt_oss",
+        "GptOssForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
+    ),
     "Glm4MoeForCausalLM": ModelSpec(
         "freetoken.models.glm4_moe",
         "Glm4MoeForCausalLM",
+        packed_modules_mapping=_EXPERTS_PACKED,
+    ),
+    # llama.cpp glm4moe GGUF (GLM-4.5, 4.5-Air, 4.6, 4.7): the same model classes with every tensor in its packed ggml type
+    "Glm4MoeGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm4_moe",
+        "Glm4MoeForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
         packed_modules_mapping=_EXPERTS_PACKED,
     ),
     # GLM-5.2 (model_type glm_moe_dsa): DeepSeek-V3.2-class MLA + DSA sparse attention
@@ -317,6 +549,21 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # llama.cpp glm5-next GGUF (unsloth GLM-5.3-Flash-GGUF): the same model classes
+    # with every tensor in its packed ggml type; a glm5v mmproj adds the vision tower
+    "Glm5NextGGUFForCausalLM": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+        checkpoint_roots=_LANGUAGE_MODEL_ROOT,
+        packed_modules_mapping=_GLM5_NEXT_PACKED,
+        mm_processor=_GLM5_NEXT_PROCESSOR,
+        encoders=_GLM5_NEXT_ENCODERS,
+        # the MLA kv_b ships as two per-head tensors (attn_k_b transposed + attn_v_b), quantized in
+        # dynamic quants (unsloth UD); the reader dequantizes and fuses them into the dense module
+        unquantized_modules=("*.self_attn.kv_b_proj",),
+    ),
 }
 
 
@@ -332,17 +579,24 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming, or None for GGUF, whose native-quant ops the shared parser does not model yet."""
-    from freetoken.layers.quantization import NameMap, QuantConfig
+def checkpoint_quant_config(
+    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = ()
+):
+    """The checkpoint's QuantConfig under the family's naming, serving its bf16 layers (those ``online_modules`` names, when given) as the ``online`` kind.
 
+    A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
+
+    name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
-        return None
-    return QuantConfig.from_hf(
-        hf_config,
-        name_map=NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping),
-        unquantized=spec.unquantized_modules,
-    )
+        to_gguf = _load_attr(spec.module, "to_gguf")
+        from freetoken.models.gguf.reader import gguf_tensor_index
+
+        types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
+        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    else:
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

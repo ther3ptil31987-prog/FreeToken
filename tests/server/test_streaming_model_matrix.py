@@ -73,6 +73,7 @@ CALL_BLOCKS = {
         "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
     ),
     "qwen25": '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>',
+    "ricursive": '<tool_call>\n{"name": "read", "arguments": {"filePath": "/tmp/test_calc.py"}}\n</tool_call>',
     "qwen3_coder": (
         "<tool_call><function=read><parameter=filePath>/tmp/test_calc.py</parameter>"
         "</function></tool_call>"
@@ -111,6 +112,7 @@ MARKUP_MARKERS = {
     "deepseekv32": ["｜DSML｜"],
     "deepseekv41": ["｜DSML｜"],
     "qwen25": ["<tool_call>", "</tool_call>"],
+    "ricursive": ["<tool_call>", "</tool_call>"],
     "qwen3_coder": ["<tool_call>", "<function="],
     "glm47": ["<arg_key>", "<arg_value>", "</tool_call>"],
     "gemma4": ["<|tool_call>", "<tool_call|>"],
@@ -126,6 +128,8 @@ MARKUP_MARKERS = {
 # family, mirroring args.py auto-inference. think_open == "" when the chat template
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
+    "flint": ("glm47", "flint", "<think>", "</think>"),
+    "ricursive": ("ricursive", "ricursive", "<think>", "</think>"),
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
     "dsv4.1": ("deepseekv41", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
@@ -319,6 +323,27 @@ def test_reasoning_generation_level(name):
     assert full.reasoning.strip() == THINKING
     assert full.content.strip() == ANSWER
     assert [c.name for c in full.tool_calls] == ["read"]
+
+
+def test_qwen3_missing_think_closer_recovers_structured_tool_call():
+    # Qwen's template pre-opens <think>. A model can skip its closing tag and
+    # transition directly to a valid XML call; recover the boundary before the
+    # tool parser runs, without treating reasoning itself as executable.
+    text = THINKING + CALL_BLOCKS["qwen3_coder"]
+    events = _stream_events(_random_chunks(text, 23), "qwen3_coder", "qwen3")
+    _assert_stream_invariants(events, "qwen3_coder")
+    assert _reasoning(events).strip() == THINKING
+    calls = _calls(events)
+    assert len(calls) == 1
+    assert calls[0].name == "read"
+    assert json.loads(calls[0].parameters) == READ_ARGS
+    assert events[-1].finish_reason == "tool_calls"
+
+    full = _full_result(text, "qwen3_coder", "qwen3")
+    assert full.reasoning.strip() == THINKING
+    assert full.content == ""
+    assert [call.name for call in full.tool_calls] == ["read"]
+    assert full.finish_reason == "tool_calls"
 
 
 async def _aiter(items):

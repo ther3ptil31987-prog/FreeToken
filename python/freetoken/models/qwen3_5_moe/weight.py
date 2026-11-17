@@ -35,17 +35,10 @@ _EXPERT_KEY_RE = (
 # role -> the expert bank reader's canonical (ModelOpt) tensor kind
 _BANK_KINDS = {"weight": "weight", "weight_scale": "weight_scale", "weight_global": "weight_scale_2"}
 
-# Gemma-style (1+weight) RMSNorm weights; the GDN gated norm (linear_attn.norm) is a plain weight*x norm
-_GEMMA_NORM_SUFFIXES = (
-    ".input_layernorm.weight",
-    ".post_attention_layernorm.weight",
-    ".self_attn.q_norm.weight",
-    ".self_attn.k_norm.weight",
-)
 # leaves the model builds as Linear layers: only their tensors are read under the QuantConfig, the rest passes through as stored
 _LINEAR_LEAVES = frozenset({
     "q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj",
-    "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head",
+    "gate_proj", "up_proj", "down_proj", "gate", "shared_expert_gate", "lm_head", "fc",
 })
 # activation scales of modules whose scheme carries no input_scale role
 _DROPPED_SUFFIXES = frozenset({"input_scale", "input_global_scale"})
@@ -61,10 +54,6 @@ def _rename(raw_name: str) -> str | None:
     if raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
         return None
     return rename_vl_prefix(raw_name)
-
-
-def _is_gemma_norm(name: str) -> bool:
-    return name == "model.norm.weight" or name.endswith(_GEMMA_NORM_SUFFIXES)
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
@@ -136,7 +125,7 @@ class _DenseReader:
         if not candidates:
             return module, 0, 1
         if len(candidates) > 1:
-            # GDN: quantized checkpoints split qkv|z from the bf16 b|a; same test as gdn.py
+            # GDN: quantized checkpoints split qkv|z from the bf16 b|a; same test as layers/linear_attn/gdn.py
             split = self.scheme(f"{parent}.in_proj_qkvz") is not None
             keep = {"in_proj_qkvz", "in_proj_ba"} if split else {"in_proj"}
             candidates = [c for c in candidates if c[0] in keep]
@@ -149,7 +138,7 @@ class _DenseReader:
         if module.rpartition(".")[2] not in _LINEAR_LEAVES:
             return None
         stored = self.stored(module)
-        roles = {"weight": "weight"} if stored is None else {e.name: r for r, e in self.quant.storage(stored).items()}
+        roles = {"weight": "weight"} if stored is None else {n: r for r, e in self.quant.storage(stored).items() for n in e.names}
         role = roles.get(suffix)
         if role is None:
             if suffix in _DROPPED_SUFFIXES:
@@ -227,7 +216,7 @@ class _DenseReader:
             g = part["weight_global"].reshape(-1).to(torch.float32)
             if g.numel() != 1:
                 raise ValueError(f"{target}: weight_global has {g.numel()} elements, expected one per-tensor scale")
-            out["weight_global"] = g.to(torch.float16).expand(rows).contiguous()
+            out["weight_global"] = g.expand(rows).contiguous()
         if "input_scale" in part:
             out["input_scale"] = part["input_scale"].reshape(()).to(torch.float32)
         return out
@@ -274,14 +263,57 @@ def _iter_shards(model_path: str, device: torch.device, reader: _DenseReader | N
                 emitted = reader.add(name, tensor)
                 if emitted is not None:
                     yield from emitted
-                elif _is_gemma_norm(name):
-                    yield name, tensor + 1.0  # (1 + weight) baked into the stored norm weight
                 else:
                     yield name, tensor
     if reader is not None and reader.pending:
         lines = reader.missing()
         shown = "\n  ".join(lines[:8]) + (f"\n  ... {len(lines) - 8} more" if len(lines) > 8 else "")
         raise ValueError(f"checkpoint is missing tensors the quant config declares for {len(lines)} modules:\n  {shown}")
+
+
+# routed experts: expert_pieces.iter_extra_layer_expert_pieces
+_MTP_EXPERTS_PREFIX = "mtp.layers.0.mlp.experts."
+_MTP_EXPERT_RE = re.compile(re.escape(_MTP_EXPERTS_PREFIX) + r"(?:(?P<expert>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<kind>weight|weight_scale_inv)|(?P<stacked>gate_up|down)_proj)$")
+
+
+def iter_mtp_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
+    """The ``mtp.*`` head but its routed experts, named as Qwen3_5MTPDraft names it, projections fused like the target's."""
+    hf_config = cached_load_hf_config(model_path)
+    reader = _DenseReader(get_quant_config(), get_model_spec(hf_config.architectures[0]))
+    seen = False
+    for file in iter_weight_files(model_path):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for raw_name in f.keys():
+                if not raw_name.startswith("mtp.") or raw_name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                    continue
+                seen = True
+                if raw_name.startswith(_MTP_EXPERTS_PREFIX):
+                    continue
+                tensor = f.get_tensor(raw_name)
+                emitted = reader.add(raw_name, tensor)
+                if emitted is None:
+                    yield raw_name[len("mtp."):], tensor
+                else:
+                    yield from ((n.removeprefix("mtp."), t) for n, t in emitted)
+    if not seen:
+        raise ValueError(f"{model_path} has no mtp.* weights")
+    if reader.pending:
+        raise ValueError(f"{model_path}: incomplete MTP projections: {reader.missing()}")
+
+
+def iter_mtp_expert_pieces(model_path: str):
+    """The MTP head's routed experts: the stacked bf16 pair, or per-expert projections with their block-fp8 scales."""
+    from freetoken.moe.expert_pieces import iter_extra_layer_expert_pieces
+
+    def locate(name: str):
+        m = _MTP_EXPERT_RE.match(name)
+        if m is None:
+            return None
+        if m["stacked"]:
+            return None, m["stacked"]
+        return int(m["expert"]), m["proj"] + ("_scale" if m["kind"] == "weight_scale_inv" else "")
+
+    return iter_extra_layer_expert_pieces(model_path, _MTP_EXPERTS_PREFIX, locate)
 
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
@@ -344,7 +376,7 @@ def _moe_dims(model_config):
     )
 
 
-def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
@@ -355,6 +387,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     L, E, H, I, dense = _moe_dims(config)
+    keep = None if layers is None else set(layers)
     scale = get_quant_config().stored_tensors(QuantKind.FP8_BLOCK)["weight_scale_inv"].name
     key_re = re.compile(_FP8_EXPERT_KEY_RE.format(scale=re.escape(scale)))
     suffix = {"weight": "", scale: "_scale"}
@@ -366,20 +399,22 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         li = int(m["layer"]) - dense
         if not 0 <= li < L:
             raise ValueError(f"unexpected routed-expert layer in {raw_name}")
+        if keep is not None and li not in keep:
+            return None
         return li, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
     if parallel is None:
         parallel = experts_scattered(model_path)
     if parallel:
         tensors = iter_expert_tensors_parallel(
-            model_path, lambda n: key_re.match(n) is not None, workers=workers, chunk=chunk
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
         )
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
     def _serial():
         reader = ShardReader(model_path, torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(range(L) if keep is None else sorted(keep), desc="Loading fp8 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
                     base = f"model.language_model.layers.{dense + li}.mlp.experts.{e}"
                     for proj in ("gate", "up", "down"):
@@ -408,6 +443,8 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
+    "iter_mtp_expert_pieces",
+    "iter_mtp_weights",
     "iter_weights",
     "iter_weights_parallel",
     "iter_expert_pieces",

@@ -35,6 +35,8 @@ class ToolChoiceObject(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: bool = False
+    # with include_usage, the chunks after the role chunk also carry the usage so far
+    continuous_usage_stats: bool | None = False
 
 
 class FunctionCall(BaseModel):
@@ -73,9 +75,12 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
+    # llama.cpp's field: every streamed chunk carries the timings block (effective only
+    # with --enable-timings-report; extra="allow" used to swallow it).
+    timings_per_token: bool = False
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     # DeepSeek-wire thinking toggle ({"type": "enabled"|"disabled"}). Any so a
@@ -111,9 +116,12 @@ class CompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stream_options: StreamOptions | None = None
+    # llama.cpp's field: every streamed chunk carries the timings block (effective only
+    # with --enable-timings-report; extra="allow" used to swallow it).
+    timings_per_token: bool = False
     stop: str | list[str] | None = None
-    presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, allow_inf_nan=False)
     ignore_eos: bool = False
     logprobs: int | None = None
     echo: bool = False

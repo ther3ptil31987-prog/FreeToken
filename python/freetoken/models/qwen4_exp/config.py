@@ -43,6 +43,8 @@ class Qwen4ExpArgs:
     index_budget: int
     index_ratio: int
     image_token_id: int | None = None
+    # GGUF stores ssm_out with its value-head columns in llama.cpp's tiled order
+    gdn_out_heads_tiled: bool = False
 
     @property
     def index_topk_blocks(self) -> int:
@@ -79,12 +81,16 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
     """Per-request PLE state riding the linear-state slots (see LinearStatePool.slot_states)."""
     if not args.ple_layer_ids:
         return ()
+    # ple.py imports this module
+    from .ple import PLEConvVerify, PLENgramVerify
+
     return (
         # dilated-conv left context; replicated (not TP-sharded), model dtype
         SlotStateSpec(
             name=PLE_CONV_STATE,
             shape=(args.ple_state_width, args.ple_conv_state_len),
             layer_ids=args.ple_layer_ids,
+            verify=PLEConvVerify,
         ),
         # last ngram_size-1 token ids, shared by every PLE layer; eos = hash boundary
         SlotStateSpec(
@@ -92,6 +98,7 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
             shape=(args.ngram_size - 1,),
             dtype=torch.int32,
             fill_value=float(args.ngram_boundary_token_id),
+            verify=PLENgramVerify,
         ),
     )
 
@@ -99,9 +106,9 @@ def ple_slot_states(args: Qwen4ExpArgs) -> Tuple[SlotStateSpec, ...]:
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
-        # HF Qwen4ExpTextConfig rewrites full_attention to qwen_sparse_attention in __post_init__.
+        # HF Qwen4ExpTextConfig rewrites full_attention to indexed_attention in __post_init__.
         return [
-            "full_attention" if t == "qwen_sparse_attention" else t for t in layer_types
+            "full_attention" if t == "indexed_attention" else t for t in layer_types
         ]
     # Fall back to full_attention_interval: every Nth layer (1-indexed) is full.
     interval = int(getattr(text, "full_attention_interval", 4))

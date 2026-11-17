@@ -16,7 +16,8 @@ from freetoken.layers import (
     LinearRowParallel,
     OPList,
 )
-from freetoken.utils import div_even
+from freetoken.layers.quantization import without_online
+from freetoken.utils import div_even, init_logger
 
 from freetoken.models.weight_stream import BlockWeightStreamer
 
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from freetoken.layers.quantization import QuantConfig
     from freetoken.message import MMItem
     from .config import VisionConfig
+
+logger = init_logger(__name__)
 
 
 class VisionLayerNorm(BaseOP):
@@ -42,14 +45,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
 
-_warned_rope_fallback = False
-
-
 def _apply_vision_rope(
     q: torch.Tensor, k: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, head_dim: int
 ) -> None:
     """In-place 2D rope through the NeoX text kernel: the [c,c]/[s,s] layout is the half-rotation layout and positions index per-token cache rows."""
-    global _warned_rope_fallback
     S = q.shape[0]
     try:
         from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
@@ -60,11 +59,7 @@ def _apply_vision_rope(
         return
     except ImportError:
         # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
-        if not _warned_rope_fallback:
-            _warned_rope_fallback = True
-            from freetoken.utils import init_logger
-
-            init_logger(__name__).warning("vision rope triton kernel unavailable; using eager")
+        logger.warning_once("vision rope triton kernel unavailable; using eager")
     half = cache.shape[1] // 2
     cos = torch.cat((cache[:, :half], cache[:, :half]), dim=-1).unsqueeze(-2)
     sin = torch.cat((cache[:, half:], cache[:, half:]), dim=-1).unsqueeze(-2)
@@ -220,6 +215,8 @@ class Qwen3VLVisionModel(BaseOP):
     """
 
     def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+        # the blocks stream to the GPU in one shared layout, which entropy-sized online buffers break
+        quant_config = without_online(quant_config)
         self.patch_embed = VisionConv3dPatchEmbed(vc)
         self.pos_embed = _EmbeddingParams(vc.num_position_embeddings, vc.hidden_size)
         self.blocks = OPList(

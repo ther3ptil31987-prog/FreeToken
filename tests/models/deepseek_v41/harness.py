@@ -20,6 +20,7 @@ from freetoken.layers.quantization.method import finalize_quant
 from freetoken.models import create_model
 from freetoken.models.deepseek_v41.config import parse_config
 from freetoken.models.deepseek_v41.engram import ZeroEngramTable
+from freetoken.models.deepseek_v41.gguf import iter_gguf_weights, parse_gguf_config
 from freetoken.models.deepseek_v41.weight import iter_weights
 from freetoken.utils.hf import cached_load_hf_config
 from freetoken.utils.torch_utils import torch_dtype
@@ -35,34 +36,35 @@ class TinyEngine:
             set_tp_info(0, 1)
         set_rope_device(self.device)
         hf_config = cached_load_hf_config(checkpoint)
-        mc = parse_config(hf_config)
+        gguf = checkpoint.endswith(".gguf")
+        mc = parse_gguf_config(hf_config) if gguf else parse_config(hf_config)
         args = mc.dsv41_args
         args.max_seq_len = max_seq_len
         args.max_batch_size = max_running_req + 1
         args.swa_decoder_replay = swa_decoder_replay
         self.args = args
         quant = NoQuantConfig()
-        if quantized:
+        offload = quantized or gguf
+        if offload:
             from freetoken.models.register import checkpoint_quant_config, get_model_spec
 
-            quant = checkpoint_quant_config(checkpoint, hf_config, get_model_spec("DeepseekV41ForCausalLM"))
-        self.config = replace(mc, moe_strategy="offload" if quantized else "fused", decode_target="gpu", quant=quant)
+            quant = checkpoint_quant_config(checkpoint, hf_config, get_model_spec(mc.architectures[0] if not gguf else "DeepseekV41GGUFForCausalLM"))
+        self.config = replace(mc, moe_strategy="offload" if offload else "fused", decode_target="gpu", quant=quant)
         mc = self.config
         with torch.device("meta"), torch_dtype(torch.bfloat16):
             self.model = create_model(self.config)
-        state = _materialize_loaded_weight_state_dict(
-            self.model.state_dict(), iter_weights(checkpoint, self.device, include_moe_experts=False), device=self.device,
-        )
+        reader = iter_gguf_weights(checkpoint, self.device, include_moe_experts=False, include_non_moe=True) if gguf else iter_weights(checkpoint, self.device, include_moe_experts=False)
+        state = _materialize_loaded_weight_state_dict(self.model.state_dict(), reader, device=self.device)
         self.model.load_state_dict(state)
         finalize_quant(self.model)
         from freetoken.moe.expert_banks import load_expert_banks
 
         method = self.model.model.layers.op_list[0].ffn.experts.quant_method
-        if quantized:
+        if offload:
             from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 
             self.banks = load_expert_banks(
-                checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False,
+                checkpoint, mc, method=method, device=self.device, parallel=False,
             )
             self.expert_cache = OffloadMoeCache(
                 num_layers=mc.num_moe_layers, num_experts=mc.num_experts,
@@ -76,7 +78,7 @@ class TinyEngine:
             from freetoken.moe.expert_banks import attach_resident_banks
 
             attach_resident_banks(list(iter_moe_layers(self.model)), load_expert_banks(
-                checkpoint, mc, method=method, device=self.device, dtype=torch.bfloat16, parallel=False, resident=True,
+                checkpoint, mc, method=method, device=self.device, parallel=False, resident=True,
             ))
         for layer in self.model.engram_layers():
             layer.attach_table(engram_table if engram_table is not None else ZeroEngramTable(layer.width, self.device))

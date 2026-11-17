@@ -27,7 +27,8 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
-    next_token: int
+    # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
+    next_tokens: List[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -48,6 +49,10 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Scheduler-measured per-request timings (ReqStats.finish): on the terminal reply,
+    # plus every intermediate reply when sampling_params.timings_per_token was set;
+    # None on other intermediate replies, errors and aborts.
+    timings: dict | None = None
 
 
 @dataclass
@@ -101,6 +106,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    error: str | None = None
+
+
+@dataclass
+class FlushCacheMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
+    request_id: str
+    timeout: float = 0.0
+
+
+@dataclass
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to FlushCacheReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported"
     error: str | None = None
 
 

@@ -1,0 +1,3 @@
+llama.cpp 8c2134a8755d8a9792af513dab20282affe903e4 (2026-10-14)
+
+Copied from llama.cpp and edited in place, see docs/ggml-kernels.md.

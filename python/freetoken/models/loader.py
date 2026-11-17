@@ -50,6 +50,13 @@ def shard_tensor(
 
 def iter_weight_files(model_path: str) -> list[str]:
     model_folder = download_hf_weight(model_path)
+    # The index is authoritative: download_hf_weight only fetches the shards it names, and it
+    # covers subdirectory layouts (nvidia's FP4-Local releases ship tensors/model-*.safetensors).
+    index = os.path.join(model_folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as f:
+            shards = sorted(set(json.load(f)["weight_map"].values()))
+        return [os.path.join(model_folder, shard) for shard in shards]
     files = glob.glob(f"{model_folder}/*.safetensors")
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
@@ -208,11 +215,11 @@ class ShardReader:
 
 
 def nvfp4_parts_ct(f, raw_base: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16], per-output-row global fp16 [O], dequant-side input_scale fp32 scalar or None)`` for the NVFP4 linear method."""
+    """compressed-tensors NVFP4 -> ``(packed uint8 [O, IN//2], block scale fp8 [O, IN//16], per-output-row global fp32 [O], dequant-side input_scale fp32 scalar or None)`` for the NVFP4 linear method."""
     w = f.get_tensor(raw_base + ".weight_packed")
     s = f.get_tensor(raw_base + ".weight_scale")
     wg = f.get_tensor(raw_base + ".weight_global_scale").reshape(1).to(torch.float32)
-    g = (1.0 / wg).to(torch.float16).expand(w.shape[0]).contiguous()
+    g = (1.0 / wg).expand(w.shape[0]).contiguous()
     a = None
     if f.has(raw_base + ".input_global_scale"):
         a = (1.0 / f.get_tensor(raw_base + ".input_global_scale").reshape(()).to(torch.float32))

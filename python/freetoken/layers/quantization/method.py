@@ -38,7 +38,8 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
             continue
         if kernel.worth_it(cfg):
             if skipped:
-                logger.info("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
+                # every layer selects its own kernel
+                logger.info_once("kernel %s selected; skipped %s", kernel.name, "; ".join(skipped))
             return kernel
         if fallback is None:
             fallback = kernel
@@ -51,11 +52,18 @@ class QuantMethod(ABC):
     kind: ClassVar[QuantKind]
     layer_kind: ClassVar[LayerKind]
     candidates: ClassVar[tuple[type, ...]] = ()
+    # declares the bf16 weight the checkpoint stores and converts it in finalize; the engine loads such weights to host first
+    online: ClassVar[bool] = False
 
     def __init__(self, cfg: Any, requested: str = "auto"):
         self.cfg = cfg
         self.requested = requested
         self.kernel = select_kernel(self.candidates, requested, cfg)
+
+    @classmethod
+    def refuses(cls, layer: Any) -> str | None:
+        """Why this online method leaves ``layer`` as the checkpoint stores it, or None when it converts it."""
+        return None
 
     @property
     def scheme(self):
@@ -63,27 +71,12 @@ class QuantMethod(ABC):
 
 def finalize_quant(root: Any) -> int:
     """Call ``quant_method.finalize(layer)`` on every layer under ``root``; returns the count."""
-    from freetoken.layers.base import BaseOP
+    from freetoken.layers.base import iter_ops
 
-    seen: set[int] = set()
     count = 0
-
-    def walk(op: Any) -> None:
-        nonlocal count
-        if id(op) in seen:
-            return
-        seen.add(id(op))
+    for op in iter_ops(root):
         method = getattr(op, "quant_method", None)
         if method is not None:
             method.finalize(op)
             count += 1
-        for value in vars(op).values():
-            if isinstance(value, BaseOP):
-                walk(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, BaseOP):
-                        walk(item)
-
-    walk(root)
     return count

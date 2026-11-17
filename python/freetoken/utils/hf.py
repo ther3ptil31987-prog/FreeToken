@@ -47,6 +47,22 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
+def load_image_processor(model_path: str) -> Any:
+    """The checkpoint's image processor; a GGUF builds it from the preprocessor_config its family derives."""
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(model_path) is not None:
+        from transformers.models.auto.image_processing_auto import get_image_processor_class_from_name
+
+        config = cached_load_hf_config(model_path).preprocessor_config
+        if config is None:
+            raise ValueError(f"{model_path}: GGUF has no vision mmproj to build an image processor from")
+        return get_image_processor_class_from_name(config["image_processor_type"]).from_dict(config)
+    from transformers import AutoImageProcessor
+
+    return AutoImageProcessor.from_pretrained(model_path)
+
+
 def load_eos_token_ids(
     model_path: str, tokenizer: PreTrainedTokenizerBase
 ) -> FrozenSet[int]:
@@ -62,13 +78,16 @@ def load_eos_token_ids(
     if (gguf_src := gguf_config_source(model_path)) is not None:
         from freetoken.models.gguf.tokenizer import gguf_eos_token_ids
 
-        return frozenset(gguf_eos_token_ids(gguf_src, tokenizer))
+        return frozenset(gguf_eos_token_ids(gguf_src))
 
     ids: set[int] = set()
     if tokenizer.eos_token_id is not None:
         ids.add(int(tokenizer.eos_token_id))
     try:
-        gen_eos = GenerationConfig.from_pretrained(model_path).eos_token_id
+        try:
+            gen_eos = GenerationConfig.from_pretrained(model_path).eos_token_id
+        except OSError:  # no generation_config.json, config.json can still list the stop ids
+            gen_eos = getattr(_load_hf_config(model_path), "eos_token_id", None)
     except Exception:
         gen_eos = None
     if isinstance(gen_eos, int):

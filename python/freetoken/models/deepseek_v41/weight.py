@@ -175,6 +175,14 @@ def engram_table_names(layer_id: int) -> tuple[str, str]:
     return f"layers.{layer_id}.engram.embed.weight", f"layers.{layer_id}.engram.embed.scale"
 
 
+def ftw_check_source(model_path: str) -> None:
+    """``convert_checkpoint`` asks this before writing anything: a GGUF keeps the Engram tables in the .gguf, which an FTW does not carry."""
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    if gguf_config_source(model_path) is not None:
+        raise NotImplementedError(f"{model_path}: an FTW of a DeepSeek-V4.1 GGUF has no Engram table to read; serve the .gguf directly")
+
+
 def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
     """Copy the checkpoint shards holding the Engram tables (fp8 rows + ue8m0 scales) next to an FTW
     checkpoint. The tables are never FTW entries: ``load_host_tables`` maps them in place from whatever
@@ -200,7 +208,7 @@ _PROJ_ROLE = {"w1": "gate", "w3": "up", "w2": "down"}
 _KIND_SUFFIX = {"weight": "", "scale": "_scale"}
 
 
-def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
+def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, layers=None, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20):
     """One piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0 ``_scale`` companions.
     The DSpark stage's experts (``mtp.*``) never match."""
     if kind is not QuantKind.MXFP4:
@@ -212,10 +220,11 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
 
     args = load_args(model_path)
     L, E = args.n_layers, args.n_routed_experts
+    keep = None if layers is None else set(layers)
 
     def locate(raw_name: str):
         m = _EXPERT_RE.match(raw_name)
-        if m is None or int(m["layer"]) >= L:
+        if m is None or int(m["layer"]) >= L or (keep is not None and int(m["layer"]) not in keep):
             return None
         return int(m["layer"]), int(m["expert"]), _PROJ_ROLE[m["proj"]] + _KIND_SUFFIX[m["kind"]]
 
@@ -226,7 +235,7 @@ def iter_expert_pieces(model_path: str, config, kind: QuantKind, *, parallel: bo
     def _serial():
         reader = _ShardReader(model_path, weight_map(model_path), torch.device("cpu"))
         try:
-            for li in tqdm(range(L), desc="Loading DeepSeek-V4.1 experts (serial)", disable=not get_tp_info().is_primary()):
+            for li in tqdm(range(L) if keep is None else sorted(keep), desc="Loading DeepSeek-V4.1 experts (serial)", disable=not get_tp_info().is_primary()):
                 for e in range(E):
                     base = f"layers.{li}.ffn.experts.{e}"
                     for proj in ("w1", "w3", "w2"):

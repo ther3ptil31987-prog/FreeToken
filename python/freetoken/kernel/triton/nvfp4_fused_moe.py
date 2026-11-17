@@ -1,14 +1,14 @@
 """Inline-dequant NVFP4 fused-MoE Triton kernels.
 
 These kernels read the NVFP4 expert cache (packed FP4 codes + fp8 block scales +
-fp16 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
+fp32 per-row global scale) *directly* and dequantize inside the GEMM K-loop, so the
 grouped MoE GEMM never materializes a BF16 copy of the experts (no separate dequant
 pass, no HBM round-trip of the 4x larger BF16 weights).
 
 Layout, for an expert weight ``W[N, K]``:
   - ``packed[slot, n, k//2]`` uint8: two FP4 codes per byte, low nibble = even k.
   - ``scale[slot, n, k//16]`` fp8-e4m3: per 16-wide block scale.
-  - ``global[slot, n]`` fp16: per-output-row scale (``weight_scale_2``).
+  - ``global[slot, n]`` fp32: per-output-row scale (``weight_scale_2``).
   - ``W[n, k] = E2M1[code] * scale[n, k//16] * global[n]``.
 
 The global scale is constant along K, so it is applied once after the K-loop.
@@ -28,8 +28,11 @@ import functools
 import torch
 import triton
 import triton.language as tl
+from triton.language import target_info
+from triton.runtime.jit import constexpr_function
 
 from freetoken.kernel.triton.e4m3_compat import e4m3_native_cx, e4m3_u8_to_f32
+from freetoken.kernel.triton.nvfp4_linear import _nvfp4_pair_f32
 
 _E2M1_VALUES = [
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -49,7 +52,7 @@ def _decode_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 2] uint8
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
@@ -131,15 +134,39 @@ def _decode_nvfp4_moe_kernel(
 
 
 @triton.jit
+def _bf16x4_to_f32(v):
+    """Four bf16 packed in one int64 -> four fp32 (a bf16 is the high half of its fp32)."""
+    lo = v.to(tl.int32)
+    hi = (v >> 32).to(tl.int32)
+    return (
+        (lo << 16).to(tl.float32, bitcast=True),
+        (lo & -65536).to(tl.float32, bitcast=True),
+        (hi << 16).to(tl.float32, bitcast=True),
+        (hi & -65536).to(tl.float32, bitcast=True),
+    )
+
+
+@triton.jit
+def _f16x4_to_f32(v):
+    lo = v.to(tl.int32)
+    hi = (v >> 32).to(tl.int32)
+    return (
+        lo.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        (lo >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        hi.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+        (hi >> 16).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32),
+    )
+
+
+@triton.jit
 def _decode_nvfp4_marlin_kernel(
     a_ptr,             # [M, K] activations (compute dtype)
     packed_ptr,        # [S, N, K // 8] int32 (8 fp4 codes per word, nibble j -> k=8*w+j)
     scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [M, TOP_K, N] output (compute dtype)
     topk_weights_ptr,  # [M, TOP_K] fp32
     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
-    lut_ptr,           # [16] fp32
     total_routes,
     N,
     K,
@@ -151,9 +178,11 @@ def _decode_nvfp4_marlin_kernel(
     stride_tw_m, stride_tw_k,
     stride_tid_m, stride_tid_k,
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_KW: tl.constexpr,  # int32 words per K-iter (covers 8*KW k-values)
+    BLOCK_SIZE_KW: tl.constexpr,  # int32 words per tile (covers 8*KW k-values)
+    UNROLL: tl.constexpr,         # tiles per loop trip
     TOP_K: tl.constexpr,
     A_ROW_IS_ROUTE: tl.constexpr,
+    A_WIDE: tl.constexpr,         # activation rows are contiguous bf16/fp16, 16-byte aligned
     MUL_ROUTED_WEIGHT: tl.constexpr,
     compute_type: tl.constexpr,
 ):
@@ -165,13 +194,18 @@ def _decode_nvfp4_marlin_kernel(
       * Loads the FP4 codes as **int32 words** (8 codes / 4 bytes per element) so the HBM
         read issues wide coalesced transactions -- the single biggest lever for the
         gate/up GEMM, whose mem-only ceiling jumps from ~65% to ~85% of peak read BW.
-      * **Defers** the K reduction: the ``[BLOCK_KW, BLOCK_N]`` partial accumulates across
+      * **Defers** the K reduction: the ``[BLOCK_N, BLOCK_KW]`` partial accumulates across
         *all* K-iters and is reduced once at the end, removing the per-iter ``tl.sum``
         barrier so the weight loads of successive iters pipeline.
 
-    The e2m1 codes share one fp8 block scale per 16 k-values (== 2 words), applied per
-    word. Mirrors the fast kernel's route/tile mapping and epilogue so it is a drop-in
-    decode GEMV (CUDA-graph safe: fixed shapes, no host sync)."""
+    Every load in the K-loop is shaped so the compiler keeps the whole loop in the word
+    tile's register layout (no shared-memory layout conversions): the block scales are
+    loaded as a half tile and interleaved in registers (one e4m3 scale per 16 k-values
+    == 2 words), the e2m1 codes are decoded with the fp16 bit trick of
+    :func:`_nvfp4_pair_f32` (2^14 folded into the scale), and with ``A_WIDE`` the 8
+    activations of a word are read as two int64 and unpacked by shifts. Mirrors the fast
+    kernel's route/tile mapping and epilogue so it is a drop-in decode GEMV (CUDA-graph
+    safe: fixed shapes, no host sync)."""
     route_id = tl.program_id(0)
     n_block_id = tl.program_id(1)
     token_id = route_id // TOP_K
@@ -185,37 +219,70 @@ def _decode_nvfp4_marlin_kernel(
     a_base = a_ptr + a_row * stride_am
 
     offs_kw = tl.arange(0, BLOCK_SIZE_KW)
+    offs_kh = tl.arange(0, BLOCK_SIZE_KW // 2)
     K_WORDS = K // 8
-    partial = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
+    partial = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
 
-    packed_slot = packed_ptr + slot * stride_pe
-    scale_slot = scale_ptr + slot * stride_se
-    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW)):
-        widx = kw_start * BLOCK_SIZE_KW + offs_kw
-        w_mask = widx < K_WORDS
+    p_base = packed_ptr + slot * stride_pe + offs_n[:, None] * stride_pn
+    s_base = scale_ptr + slot * stride_se + offs_n[:, None] * stride_sn
+    for kw_start in range(0, tl.cdiv(K_WORDS, BLOCK_SIZE_KW), UNROLL):
+        for u in tl.static_range(UNROLL):
+            widx = (kw_start + u) * BLOCK_SIZE_KW + offs_kw
+            w_mask = widx < K_WORDS
+            word = tl.load(
+                p_base + widx[None, :] * stride_pkw,
+                mask=n_mask[:, None] & w_mask[None, :], other=0,
+            )
+            hidx = (kw_start + u) * (BLOCK_SIZE_KW // 2) + offs_kh
+            s_ptrs = s_base + hidx[None, :] * stride_sblk
+            s_mask = n_mask[:, None] & (hidx[None, :] < K_WORDS // 2)
+            if e4m3_native_cx():
+                s_half = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
+            else:
+                s_half = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            s_half = s_half * 16384.0
+            scale = tl.interleave(s_half, s_half)
 
-        word = tl.load(
-            packed_slot + offs_n[None, :] * stride_pn + widx[:, None] * stride_pkw,
-            mask=w_mask[:, None] & n_mask[None, :], other=0,
-        )
-        # 8 codes/word fall in the same or adjacent 16-wide block -> one scale per word.
-        s_ptrs = scale_slot + offs_n[None, :] * stride_sn + (widx[:, None] // 2) * stride_sblk
-        s_mask = w_mask[:, None] & n_mask[None, :]
-        if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=s_mask, other=0.0).to(tl.float32)
-        else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=s_mask, other=0))
+            if A_WIDE:
+                a64 = a_base.to(tl.pointer_type(tl.int64), bitcast=True)
+                v = tl.load(
+                    a64 + widx[:, None] * 2 + tl.arange(0, 2)[None, :],
+                    mask=w_mask[:, None], other=0,
+                )
+                v0, v1 = tl.split(v)
+                if a_ptr.dtype.element_ty == tl.bfloat16:
+                    a0, a1, a2, a3 = _bf16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _bf16x4_to_f32(v1)
+                else:
+                    a0, a1, a2, a3 = _f16x4_to_f32(v0)
+                    a4, a5, a6, a7 = _f16x4_to_f32(v1)
+            else:
+                kbase = 8 * widx
+                a0 = tl.load(a_base + kbase * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a1 = tl.load(a_base + (kbase + 1) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a2 = tl.load(a_base + (kbase + 2) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a3 = tl.load(a_base + (kbase + 3) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a4 = tl.load(a_base + (kbase + 4) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a5 = tl.load(a_base + (kbase + 5) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a6 = tl.load(a_base + (kbase + 6) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+                a7 = tl.load(a_base + (kbase + 7) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
 
-        kbase = 8 * widx
-        acc_w = tl.zeros((BLOCK_SIZE_KW, BLOCK_SIZE_N), dtype=tl.float32)
-        for j in tl.static_range(8):
-            code = (word >> (4 * j)) & 0xF
-            b = tl.load(lut_ptr + code)
-            a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
-            acc_w += a_j[:, None] * b
-        partial += acc_w * scale
+            acc_w = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_KW), dtype=tl.float32)
+            b0, b4 = _nvfp4_pair_f32(word)
+            b1, b5 = _nvfp4_pair_f32(word >> 4)
+            b2, b6 = _nvfp4_pair_f32(word >> 8)
+            b3, b7 = _nvfp4_pair_f32(word >> 12)
+            acc_w += a0[None, :] * b0
+            acc_w += a1[None, :] * b1
+            acc_w += a2[None, :] * b2
+            acc_w += a3[None, :] * b3
+            acc_w += a4[None, :] * b4
+            acc_w += a5[None, :] * b5
+            acc_w += a6[None, :] * b6
+            acc_w += a7[None, :] * b7
+            partial += acc_w * scale
 
-    accumulator = tl.sum(partial, axis=0)
+    accumulator = tl.sum(partial, axis=1)
     g = tl.load(global_ptr + slot * stride_ge + offs_n * stride_gn, mask=n_mask, other=0.0).to(tl.float32)
     accumulator = accumulator * g
 
@@ -228,17 +295,76 @@ def _decode_nvfp4_marlin_kernel(
 
 
 @triton.jit
+def _e2m1_f16_x2p14(code):
+    """e2m1 code (low 4 bits) -> fp16 value * 2^-14: magnitude bits go to fp16 [11:9], the sign to [15]; fp16 subnormals line up the e == 0 codes."""
+    bits = ((code & 7) << 9) | ((code & 8) << 12)
+    return bits.to(tl.uint16).to(tl.float16, bitcast=True)
+
+
+@constexpr_function
+def _bf16x2_mul_native():
+    return target_info.cuda_capability_geq(9, 0)
+
+
+@triton.jit
+def _bf16x2_scale(w, s2):
+    if _bf16x2_mul_native():
+        return tl.inline_asm_elementwise("mul.rn.bf16x2 $0, $1, $2;", "=r,r,r", [w, s2], tl.uint32, True, 1)
+    else:
+        # mul.bf16x2 is sm_90+; fma with a -0.0 addend gives the same product
+        return tl.inline_asm_elementwise("{ .reg .b32 z; mov.b32 z, 0x80008000; fma.rn.bf16x2 $0, $1, $2, z; }",
+                                         "=r,r,r", [w, s2], tl.uint32, True, 1)
+
+
+@triton.jit
+def _bf16x2_halves(w):
+    lo = (w & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    hi = (w >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    return lo, hi
+
+
+@triton.jit
+def _e2m1x8_bf16(q, s2, BLOCK_N: tl.constexpr, BLOCK_W: tl.constexpr):
+    """[BLOCK_N, BLOCK_W] uint32 words of 8 e2m1 codes -> [BLOCK_N, 8 * BLOCK_W] bf16 in k order, times s2 * 2^-126."""
+    # each 16-bit half's top nibble becomes a bf16 sign + exponent/mantissa: e2m1 * 2^-126, exact incl. e == 0
+    o0 = _bf16x2_scale((q & 0x80008000) | ((q >> 6) & 0x01C001C0), s2)
+    q1 = q << 4
+    o1 = _bf16x2_scale((q1 & 0x80008000) | ((q1 >> 6) & 0x01C001C0), s2)
+    q2 = q << 8
+    o2 = _bf16x2_scale((q2 & 0x80008000) | ((q2 >> 6) & 0x01C001C0), s2)
+    q3 = q << 12
+    o3 = _bf16x2_scale((q3 & 0x80008000) | ((q3 >> 6) & 0x01C001C0), s2)
+    # o0..o3 hold the k pairs (3, 7), (2, 6), (1, 5), (0, 4); join appends the new axis last
+    k0, k4 = _bf16x2_halves(o3)
+    k1, k5 = _bf16x2_halves(o2)
+    k2, k6 = _bf16x2_halves(o1)
+    k3, k7 = _bf16x2_halves(o0)
+    w = tl.join(tl.join(tl.join(k0, k4), tl.join(k2, k6)), tl.join(tl.join(k1, k5), tl.join(k3, k7)))
+    return tl.reshape(w, (BLOCK_N, 8 * BLOCK_W))
+
+
+@triton.jit
+def _e2m1x2_bf16(v, s2, BLOCK_N: tl.constexpr, BLOCK_KB: tl.constexpr):
+    """[BLOCK_N, BLOCK_KB] bytes of 2 e2m1 codes -> [BLOCK_N, 2 * BLOCK_KB] bf16 in k order, times s2 * 2^-126."""
+    # low nibble -> low bf16, high nibble -> high bf16: sign to bit 15 / 31, exponent and mantissa to bits 8..6 / 24..22
+    pair = ((v & 0x8) << 12) | ((v & 0x7) << 6) | ((v & 0x80) << 24) | ((v & 0x70) << 18)
+    lo, hi = _bf16x2_halves(_bf16x2_scale(pair.to(tl.uint32, bitcast=True), s2))
+    return tl.reshape(tl.join(lo, hi), (BLOCK_N, 2 * BLOCK_KB))
+
+
+@triton.jit
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8
-    scale_ptr,         # [S, N, K // 16] fp8-e4m3
-    global_ptr,        # [S, N] fp16
+    scale_ptr,         # [S, N, K // 16] fp8-e4m3 (uint8 view before sm_89)
+    global_ptr,        # [S, N] fp32
     c_ptr,             # [num_valid_tokens, N] output (flat over M*top_k)
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,    # cache slot per M-block
     num_tokens_post_padded_ptr,
-    lut_ptr,
+    w_desc,            # TMA descriptor over packed as [S * N, K // 2], or None
+    s_desc,            # TMA descriptor over scale as [S * N, K // 16], or None
     N,
     K,
     EM,
@@ -249,14 +375,20 @@ def _prefill_nvfp4_moe_kernel(
     stride_ge, stride_gn,
     stride_cm, stride_cn,
     stride_tw,
-    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,   # tokens per block, the moe_align padding
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_KB: tl.constexpr,
+    BLOCK_SIZE_KB: tl.constexpr,  # packed bytes per K step (2 values each)
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
+    USE_TMA: tl.constexpr = False,     # needs K % 256 == 0
+    TMA_SCALES: tl.constexpr = False,  # with USE_TMA: scales by TMA too, else pointer loads
+    FAST_DECODE: tl.constexpr = 0,     # 0: fp16 pair decode, 1: packed_ptr / w_desc are int32 views of 8 codes, 2: bytes
+    SCALE_WORDS: tl.constexpr = False,  # with FAST_DECODE == 1 and pointer loads: scale_ptr is an int32 view of 4 scales
 ):
+    # out^T = W @ X^T: wgmma reads its A operand (the decoded weights) from registers, while B must be in shared memory.
+    # The token block is the MMA N dimension, so a 16-token block still fills the MMA.
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -277,51 +409,110 @@ def _prefill_nvfp4_moe_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_kb = tl.arange(0, BLOCK_SIZE_KB)
-    a_ptrs_lo = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb)[None, :] * stride_ak)
-    a_ptrs_hi = a_ptr + (offs_token[:, None] // top_k * stride_am + (2 * offs_kb + 1)[None, :] * stride_ak)
+    offs_k = tl.arange(0, 2 * BLOCK_SIZE_KB)
+    offs_sb = tl.arange(0, BLOCK_SIZE_KB // 8)
+    KW: tl.constexpr = BLOCK_SIZE_KB // 4
+    offs_kw = tl.arange(0, KW)
+    xt_ptrs = a_ptr + (offs_token[None, :] // top_k * stride_am + offs_k[:, None] * stride_ak)
 
     slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    packed_base = packed_ptr + slot * stride_pe + offs_bn[None, :] * stride_pn
-    scale_base = scale_ptr + slot * stride_se + offs_bn[None, :] * stride_sn
+    WORDS: tl.constexpr = FAST_DECODE == 1
+    if WORDS:
+        p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kw[None, :] * stride_pkb
+    else:
+        p_ptrs = packed_ptr + slot * stride_pe + offs_bn[:, None] * stride_pn + offs_kb[None, :] * stride_pkb
+    tl.static_assert(not SCALE_WORDS or (WORDS and not USE_TMA and BLOCK_SIZE_KB >= 32))
+    SW: tl.constexpr = BLOCK_SIZE_KB // 32
+    if SCALE_WORDS:
+        offs_sw = tl.arange(0, SW)
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sw[None, :] * stride_sblk
+    else:
+        s_ptrs = scale_ptr + slot * stride_se + offs_bn[:, None] * stride_sn + offs_sb[None, :] * stride_sblk
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     K_BYTES = K // 2
+    # rows past N belong to the next slot; their outputs are masked on store
+    w_row = (slot * N + pid_n * BLOCK_SIZE_N).to(tl.int32)
+    SB: tl.constexpr = BLOCK_SIZE_KB // 8
     for kb in range(0, tl.cdiv(K_BYTES, BLOCK_SIZE_KB)):
-        byte_idx = kb * BLOCK_SIZE_KB + offs_kb
-        byte_mask = byte_idx < K_BYTES
-
-        p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
-        bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
-        lo = bytes_ & 0xF
-        hi = (bytes_ >> 4) & 0xF
-        sblk = byte_idx // 8
-        s_ptrs = scale_base + sblk[:, None] * stride_sblk
-        if e4m3_native_cx():
-            scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
+        k_mask = kb * 2 * BLOCK_SIZE_KB + offs_k < K
+        if USE_TMA and WORDS:
+            v = w_desc.load([w_row, kb * KW])
+        elif USE_TMA:
+            v = w_desc.load([w_row, kb * BLOCK_SIZE_KB]).to(tl.int32)
+        if USE_TMA and TMA_SCALES:
+            # a TMA box row needs >= 16 bytes, so load the 16 scales that hold this step and pick its SB of them
+            s16 = s_desc.load([w_row, (kb * SB) // 16 * 16]).to(tl.uint8, bitcast=True)
+            s3 = tl.reshape(s16, (BLOCK_SIZE_N, 16 // SB, SB))
+            pick = tl.arange(0, 16 // SB) == (kb * SB) % 16 // SB
+            s = tl.sum(tl.where(pick[None, :, None], s3, 0), axis=1).to(tl.uint8)
+            s = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        elif USE_TMA:
+            sblk_mask = kb * SB + offs_sb < K_BYTES // 8
+            s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
         else:
-            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
-        b_hi = tl.load(lut_ptr + hi) * scale
-
-        a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype))
-        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype))
-
-        a_ptrs_lo += BLOCK_SIZE_KB * 2 * stride_ak
-        a_ptrs_hi += BLOCK_SIZE_KB * 2 * stride_ak
+            sblk_mask = kb * SB + offs_sb < K_BYTES // 8
+            if WORDS:
+                v = tl.load(p_ptrs, mask=(kb * KW + offs_kw < K_BYTES // 4)[None, :], other=0)
+            else:
+                byte_mask = kb * BLOCK_SIZE_KB + offs_kb < K_BYTES
+                v = tl.load(p_ptrs, mask=byte_mask[None, :], other=0).to(tl.int32)
+            if SCALE_WORDS:
+                # 4-byte loads can go through the cp.async pipeline, byte loads cannot; spread each word over the 8 weight words it scales
+                sw = tl.load(s_ptrs, mask=(kb * SW + offs_sw < K_BYTES // 32)[None, :], other=0)
+                sw = tl.reshape(tl.broadcast_to(sw[:, :, None], (BLOCK_SIZE_N, SW, KW // SW)), (BLOCK_SIZE_N, KW))
+                s = ((sw >> ((offs_kw // 2 % 4) * 8)[None, :]) & 0xFF).to(tl.uint8)
+                if e4m3_native_cx():
+                    s = s.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                else:
+                    s = e4m3_u8_to_f32(s)
+            elif e4m3_native_cx():
+                s = tl.load(s_ptrs, mask=sblk_mask[None, :], other=0.0).to(tl.float32)
+            else:
+                s = e4m3_u8_to_f32(tl.load(s_ptrs, mask=sblk_mask[None, :], other=0))
+        if FAST_DECODE:
+            # 2^118 here and the decode's 2^-126 leave 2^-8, undone in the epilogue; every step is exact in bf16
+            s = (s * 3.3230699894622794e35).to(tl.bfloat16).to(tl.uint16, bitcast=True).to(tl.uint32)
+            s = s | (s << 16)
+            if WORDS:
+                if not SCALE_WORDS:
+                    # one scale per 16 values, two words
+                    s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 2)), (BLOCK_SIZE_N, KW))
+                w = _e2m1x8_bf16(v.to(tl.uint32, bitcast=True), s, BLOCK_SIZE_N, KW)
+            else:
+                # one scale per 16 values, eight bytes
+                s = tl.reshape(tl.broadcast_to(s[:, :, None], (BLOCK_SIZE_N, SB, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
+                w = _e2m1x2_bf16(v, s, BLOCK_SIZE_N, BLOCK_SIZE_KB)
+        else:
+            # one scale per 16 values; the 2^14 undoes the decode's 2^-14
+            s = tl.reshape(tl.broadcast_to((s * 16384.0)[:, :, None], (BLOCK_SIZE_N, BLOCK_SIZE_KB // 8, 8)), (BLOCK_SIZE_N, BLOCK_SIZE_KB))
+            s = s.to(tl.bfloat16)
+            # exact in bf16: e2m1 has <= 2 significant bits and e4m3 <= 4
+            w_lo = _e2m1_f16_x2p14(v & 0xF).to(tl.bfloat16) * s
+            w_hi = _e2m1_f16_x2p14(v >> 4).to(tl.bfloat16) * s
+            # interleave back to k = 2 * byte + {0, 1} so one dot covers the K step
+            w = tl.reshape(tl.join(w_lo, w_hi), (BLOCK_SIZE_N, 2 * BLOCK_SIZE_KB))
+        xt = tl.load(xt_ptrs, mask=k_mask[:, None] & token_mask[None, :], other=0.0)
+        accumulator = tl.dot(w.to(xt.dtype), xt, accumulator)
+        xt_ptrs += 2 * BLOCK_SIZE_KB * stride_ak
+        if not USE_TMA:
+            p_ptrs += (KW if WORDS else BLOCK_SIZE_KB) * stride_pkb
+        if not (USE_TMA and TMA_SCALES):
+            s_ptrs += (SW if SCALE_WORDS else BLOCK_SIZE_KB // 8) * stride_sblk
 
     g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
-    accumulator = accumulator * g[None, :]
+    if FAST_DECODE:
+        g = g * 256.0
+    accumulator = accumulator * g[:, None]
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token * stride_tw, mask=token_mask, other=0)
-        accumulator = accumulator * moe_weight[:, None]
+        accumulator = accumulator * moe_weight[None, :]
 
     accumulator = accumulator.to(compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_ptrs = c_ptr + stride_cm * offs_token[None, :] + stride_cn * offs_cn[:, None]
+    c_mask = token_mask[None, :] & (offs_cn[:, None] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 

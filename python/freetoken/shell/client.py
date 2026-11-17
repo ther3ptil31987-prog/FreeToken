@@ -27,7 +27,7 @@ from typing import Any
 import openai
 from openai import AsyncOpenAI
 
-# Any string is accepted by the server; sent so the SDK doesn't refuse to build a request.
+# Sent when no key is given: a server without --api-key accepts any string, and the SDK needs one.
 LOCAL_API_KEY = "freetoken-local"
 CONTROL_TIMEOUT = 10.0
 # Per-read timeout on the chat stream. Generous: it has to cover the gap before the first
@@ -45,14 +45,17 @@ class ShellClientError(Exception):
         self.status = status
 
 
+# completion_tokens: the turn's running total sent with the chunk; None when the server sends usage only at the end
 @dataclass(frozen=True)
 class ReasoningDelta:
     text: str
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
 class ContentDelta:
     text: str
+    completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,14 +100,15 @@ class ShellClient:
         self,
         origin: str,
         *,
-        api_key: str = LOCAL_API_KEY,
+        api_key: str | None = None,
         timeout: float = CONTROL_TIMEOUT,
     ) -> None:
         self.origin = origin.rstrip("/")
         self.timeout = timeout
+        self._api_key = api_key or LOCAL_API_KEY
         self._openai = AsyncOpenAI(
             base_url=f"{self.origin}/v1",
-            api_key=api_key,
+            api_key=self._api_key,
             max_retries=0,  # a retried chat request would generate the turn twice
             timeout=openai.Timeout(CHAT_READ_TIMEOUT, connect=10.0),
         )
@@ -118,7 +122,7 @@ class ShellClient:
         self, method: str, path: str, body: dict[str, Any] | None, timeout: float
     ) -> dict[str, Any]:
         data = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._api_key}"}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -273,7 +277,7 @@ class ShellClient:
             "model": model,
             "messages": messages,
             "stream": True,
-            "stream_options": {"include_usage": True},
+            "stream_options": {"include_usage": True, "continuous_usage_stats": True},
         }
         if sampling.max_tokens is not None:
             request["max_tokens"] = sampling.max_tokens
@@ -302,6 +306,7 @@ class ShellClient:
                 if usage is not None:
                     prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
                     completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                running = completion_tokens if usage is not None else None
                 for choice in chunk.choices or []:
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
@@ -312,9 +317,9 @@ class ShellClient:
                     # SDK keeps unknown fields, so read it off the model as an extra.
                     reasoning = getattr(delta, "reasoning_content", None)
                     if reasoning:
-                        yield ReasoningDelta(reasoning)
+                        yield ReasoningDelta(reasoning, running)
                     if delta.content:
-                        yield ContentDelta(delta.content)
+                        yield ContentDelta(delta.content, running)
         except openai.APIError as exc:
             raise ShellClientError(f"stream failed: {exc}") from exc
         finally:

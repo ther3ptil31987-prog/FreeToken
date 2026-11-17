@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
@@ -38,6 +38,8 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
+    # kept out of repr: parse_args logs the whole ServerArgs
+    api_key: str | None = field(default=None, repr=False)
     num_tokenizer: int = 0
     silent_output: bool = False
     # The terminal shell is attached to this server (ft shell --model / ft serve --shell-mode).
@@ -59,6 +61,10 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    # Attach llama.cpp's per-request `timings` object to OpenAI chat/completions and
+    # Responses responses (plus queue_ms and, under speculative decoding, draft_n /
+    # draft_n_accepted). Opt-in like vLLM's --enable-per-request-metrics.
+    enable_timings_report: bool = False
     anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
@@ -131,7 +137,9 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.format import KV_FORMATS, NONE
     from freetoken.moe import MOE_STRATEGIES
+    from freetoken.moe.pool_policy import SCOPES
 
     def _parse_quant_backend(value: str) -> str:
         from freetoken.layers.quantization import QuantBackend
@@ -142,6 +150,12 @@ def parse_args(
             raise argparse.ArgumentTypeError(str(exc)) from None
         return value
 
+    def _parse_module_list(value: str) -> tuple[str, ...]:
+        names = tuple(p.strip() for p in value.split(",") if p.strip())
+        if not names:
+            raise argparse.ArgumentTypeError("expected comma-separated module names or glob patterns")
+        return names
+
     def _parse_moe_cache_rate(value: str) -> float:
         try:
             rate = float(value)
@@ -150,6 +164,27 @@ def parse_args(
         if not 0 <= rate <= 1:
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
+
+    def _parse_mem_size(value: str) -> int:
+        units = {
+            "b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10, "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
+            "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30,
+        }
+        text = value.strip().lower()
+        number = text.rstrip("abgikm")
+        unit = text[len(number):]
+        try:
+            size = int(float(number) * units[unit])
+        except (KeyError, ValueError, OverflowError) as exc:
+            raise argparse.ArgumentTypeError("must be a size with a unit, e.g. 12GiB or 800MiB") from exc
+        if size <= 0:
+            raise argparse.ArgumentTypeError("must be positive")
+        return size
+
+    def _parse_cache_split(value: str) -> str:
+        if value == "equal" or (value.startswith("profile:") and len(value) > len("profile:")):
+            return value
+        raise argparse.ArgumentTypeError("must be equal or profile:<path>")
 
     def _positive_int(value: str) -> int:
         try:
@@ -182,6 +217,11 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        # off the checkpoint only: the HF org name ricursiveAI would match other models' paths
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
+        if "flint" in marker:
+            return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         # M3 first: its marker also contains the bare "minimax" substring, but the
@@ -233,6 +273,10 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "ricursive" in " ".join(candidates[1:]).lower():
+            return "ricursive"
+        if "flint" in marker:
+            return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
@@ -369,6 +413,15 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--api-key",
+        type=str,
+        default=ServerArgs.api_key,
+        help="Require this key on every route except /health, sent as "
+        "'Authorization: Bearer <key>' or 'x-api-key: <key>'. Defaults to $FREETOKEN_API_KEY; "
+        "unset serves without authentication.",
+    )
+
+    parser.add_argument(
         "--cuda-graph-max-bs",
         "--graph",
         type=int,
@@ -455,6 +508,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
+        help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
+        "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
+        "attention backends read "
+        "them. They need --dtype bfloat16 and no tensor parallelism. An mtp draft stores its KV in the same format.",
+    )
+
+    parser.add_argument(
         "--text-model-only",
         action="store_true",
         default=False,
@@ -469,6 +533,15 @@ def parse_args(
         default=[],
         metavar="{vision,audio}",
         help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
+    )
+    parser.add_argument(
+        "--mmproj",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="llama.cpp vision tower (mmproj GGUF) for a GGUF model. Default: a *mmproj*.gguf that fits the model "
+        "in the model file's folder (BF16 > F32 > F16 > quantized when several are there); none found, or files of "
+        "several models, serves text only.",
     )
 
     parser.add_argument(
@@ -539,6 +612,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-timings-report",
+        action="store_true",
+        default=ServerArgs.enable_timings_report,
+        help=(
+            "Attach a llama.cpp-shaped per-request timings object to every chat completion, "
+            "completion and Responses response (and to the final stream chunk), so frontends "
+            "like llama-swap and Open Web UI can show prefill/decode rates and cache hits. "
+            "Spans are measured in the scheduler; queue_ms is a FreeToken extension."
+        ),
+    )
+
+    parser.add_argument(
         "--anthropic-inline-system",
         choices=("auto", "preserve", "fold"),
         default=ServerArgs.anthropic_inline_system,
@@ -576,6 +661,7 @@ def parse_args(
             "qwen",
             "qwen25",
             "qwen3_coder",
+            "ricursive",
             "mistral",
             "deepseekv32",
             "deepseekv41",
@@ -596,7 +682,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint", "ricursive",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -611,9 +697,8 @@ def parse_args(
         default=ServerArgs.moe_strategy,
         choices=["auto", *MOE_STRATEGIES],
         help=(
-            "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
-            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
+            "How the routed experts are served. 'auto' resolves a MoE model to 'offload', and to "
+            "resident 'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
@@ -645,6 +730,41 @@ def parse_args(
         help=(
             "Where a PLE n-gram table lives. 'disk' (default) reads rows straight from the "
             "checkpoint files; 'pinned' preloads the whole table into page-locked host RAM."
+        ),
+    )
+
+    parser.add_argument(
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
+        help=(
+            "Where the input token embedding tables live. 'gpu' (default) keeps them in VRAM; 'host' keeps them in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. "
+            "A table tied to the LM head stays on the GPU; Gemma-4 E2B / E4B's per-layer table is the one that moves."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant",
+        default=ServerArgs.online_quant,
+        choices=["df11"],
+        help=(
+            "Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. 'df11' "
+            "compresses them losslessly to ~11 bits per weight and decodes them bit-for-bit on use: about 30%% less "
+            "VRAM for those weights, at the cost of a decode per use. The LM head, a table tied to it, vision encoders and "
+            "layers whose weight the model reads directly stay bf16; refused when no layer qualifies."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant-modules",
+        default=ServerArgs.online_quant_modules,
+        type=_parse_module_list,
+        help=(
+            "Limit --online-quant to these modules: comma-separated checkpoint module names or glob patterns, "
+            "e.g. 'model.layers.*.self_attn,model.embed_tokens' ('model.language_model.layers.*' where the checkpoint "
+            "nests the text model). A name also covers the modules under it; one that selects no convertible layer is "
+            "refused. Default: every layer --online-quant can convert."
         ),
     )
 
@@ -695,6 +815,12 @@ def parse_args(
         help="The fraction of all MoE experts to keep in GPU cache.",
     )
     moe_cache_group.add_argument(
+        "--moe-cache-mem",
+        type=_parse_mem_size,
+        default=ServerArgs.moe_cache_mem,
+        help="GPU memory for the MoE expert slot cache, e.g. 12GiB or 800MiB (G, GB and GiB all mean GiB); the slot count is this over the bytes per slot.",
+    )
+    moe_cache_group.add_argument(
         "--moe-cache-auto",
         action="store_true",
         default=ServerArgs.moe_cache_auto,
@@ -709,6 +835,27 @@ def parse_args(
         type=int,
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+    )
+
+    parser.add_argument(
+        "--moe-cache-scope",
+        choices=SCOPES,
+        default=ServerArgs.moe_cache_scope,
+        help=(
+            "How MoE layers share the GPU expert slot cache: unified = one LRU pool per expert quant "
+            "(all layers when they share one quant format); per-layer = each layer has its own pool. "
+            "Pools are sized by --moe-cache-split."
+        ),
+    )
+    parser.add_argument(
+        "--moe-cache-split",
+        type=_parse_cache_split,
+        default=ServerArgs.moe_cache_split,
+        help=(
+            "How pools share the slots: equal (by layer count), or profile:<path> = by expert use from a "
+            "profile file. With --moe-strategy offload, a pool smaller than the expert count limits the "
+            "decode batch to its slots / top_k."
+        ),
     )
 
     parser.add_argument(
@@ -736,11 +883,13 @@ def parse_args(
             "With --moe-strategy offload/hybrid: which MoE layers compute on the "
             "CPU executor instead of the GPU offload/PCIe path (where CUDA pinning "
             "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
-            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for Windows/WSL "
-            "only, where CUDA pinned memory is capped: it locks just enough head+tail layers "
-            "for the banks over the pin budget. Any value, 'auto' included, commits to CPU "
+            "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for hosts that cap CUDA "
+            "pinned memory (Windows/WSL): it pins the banks layer by layer from the middle out until CUDA "
+            "refuses one and OS-locks the rest. FREETOKEN_PIN_BUDGET_GB, FTW checkpoints and models the CPU executor "
+            "cannot serve lock head+tail layers from a size estimate instead. Under hybrid, locked layers still decode from GPU slots "
+            "(--moe-locked-fetch). Any value, 'auto' included, commits to CPU "
             "decode before the model is built, so the expert format must have a CPU executor "
-            "path (bf16, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
+            "path (bf16, fp8_block, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
             "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
         ),
     )
@@ -753,8 +902,32 @@ def parse_args(
             "For --moe-strategy hybrid: max experts fetched over PCIe per (layer, decode "
             "step); the rest of that step's misses are computed on the CPU, overlapped. "
             "-1 (default) = auto: fetch the benched pcie/cpu bandwidth fraction of each "
-            "step's misses (perfect overlap; needs an `ft bench bw` profile, else 1). "
+            "step's misses (perfect overlap; needs the `ft bench bw` row of the layer's kind, "
+            "from `ft bench bw --model <checkpoint>`, else 1). "
             "0 = never fetch (all misses on CPU); large = behaves like plain offload."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-locked-fetch",
+        type=float,
+        default=ServerArgs.moe_locked_fetch,
+        help=(
+            "For --moe-strategy hybrid with locked layers (banks over the pin quota, OS-locked instead of pinned): "
+            "the share of a locked layer's misses fetched per decode step into GPU slots of its own pools, through "
+            "pinned staging that CPU threads fill; the rest are computed on the CPU. -1 (default) = auto: per layer from "
+            "the `ft bench bw` row of its kind, p / (2p + c) of the overlapped PCIe and CPU MoE rates (at most 1 expert "
+            "per step without a row). 0 = locked layers decode on the CPU only."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-locked-max-fetch",
+        type=int,
+        default=ServerArgs.moe_locked_max_fetch,
+        help=(
+            "For --moe-locked-fetch: the most experts a locked layer fetches per decode step. Sizes the pinned "
+            "staging: this many rows of the widest expert, per bank."
         ),
     )
 
@@ -786,6 +959,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "With the offload-family strategies: after each decode log line, log the decode MoE stats since the "
+            "previous one (hit rate, and per layer-step the misses, experts fetched to the GPU and experts computed "
+            "on the CPU) for pinned layers, locked layers with GPU slots and CPU-only layers. Adds counter updates "
+            "to every decode step."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-prefill-hit-d2d",
         action="store_true",
         dest="moe_prefill_hit_d2d",
@@ -793,9 +978,44 @@ def parse_args(
         help=(
             "During prefill prefetch, copy cache-resident experts device-side into "
             "the double buffer and stream only the misses over PCIe "
-            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
+            "(CUDA >= 13.0 or HIP with batch-copy support). Effective with "
             "--moe-cache-size > 2 * num_experts."
         ),
+    )
+
+    parser.add_argument(
+        "--speculative-algorithm",
+        "--spec-algo",
+        type=str,
+        default=ServerArgs.speculative_algorithm,
+        help=(
+            "Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers; dflash: a DFlash 2 draft "
+            "checkpoint from --speculative-draft-model-path). Off by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--speculative-num-steps",
+        "--spec-num-steps",
+        type=int,
+        default=ServerArgs.speculative_num_steps,
+        help="Draft tokens per decode step (k); 0 takes the method's default.",
+    )
+
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        "--spec-draft-model",
+        type=str,
+        default=ServerArgs.speculative_draft_model_path,
+        help="Draft weights; by default they come from the target checkpoint. Required for dflash, which reads a separate draft checkpoint.",
+    )
+
+    parser.add_argument(
+        "--speculative-token-map",
+        "--spec-token-map",
+        type=str,
+        default=ServerArgs.speculative_token_map,
+        help="File of little-endian int32 token ids the draft may propose (mtp only). The draft computes logits over those LM head rows alone; the target still verifies over the whole vocabulary. Off by default.",
     )
 
     parser.add_argument(
@@ -842,8 +1062,26 @@ def parse_args(
         if entry:
             kwargs["quant_backend"] = entry
 
+    # an empty flag usually means an unset shell variable; refuse it rather than serve open
+    if kwargs["api_key"] == "":
+        parser.error("--api-key is empty; omit it to serve without authentication")
+    from freetoken.launch import resolve_api_key
+
+    kwargs["api_key"] = resolve_api_key(kwargs["api_key"])
+
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    # every process reads the GGUF config, tokenizer workers included, so the choice travels in the environment
+    from freetoken.models.gguf.mmproj import MMPROJ_ENV
+
+    os.environ.pop(MMPROJ_ENV, None)
+    if (mmproj := kwargs.pop("mmproj")) is not None:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        if not is_gguf_path(kwargs["model_path"]):
+            parser.error("--mmproj needs a .gguf model file")
+        os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:
@@ -874,6 +1112,7 @@ def parse_args(
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
         and not kwargs["moe_cache_auto"]
+        and kwargs["moe_cache_mem"] is None
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )
     if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:

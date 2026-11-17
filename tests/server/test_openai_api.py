@@ -4,6 +4,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken.message import TokenizeMsg, UserReply
@@ -15,7 +16,9 @@ from freetoken.server.openai_api import (
     handle_completion,
     register_openai_routes,
     stream_chat_completion_chunks,
+    stream_completion_chunks,
 )
+from freetoken.server.responses_api import ResponsesRequest, handle_responses
 
 
 def run(coro):
@@ -356,6 +359,24 @@ def test_completion_rejects_token_id_prompts():
     assert "token-id prompt" in body["error"]["message"]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [0, 2])
+def test_completion_refuses_n_other_than_one(n, stream):
+    state = FakeState([UserReply(uid=42, incremental_output="hello", finished=True)])
+    response = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="say hi", n=n, stream=stream),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["param"] == "n"
+    assert state.sent is None
+
+
 def test_completion_accepts_text_prompt():
     state = FakeState(
         [UserReply(uid=42, incremental_output="hello", finished=True, prompt_tokens_delta=2, completion_tokens_delta=1)]
@@ -390,6 +411,80 @@ def test_completion_forwards_length_finish_reason():
         )
     )
     assert response["choices"][0]["finish_reason"] == "length"
+
+
+class _PerPromptState(FakeState):
+    """new_user hands out one uid per prompt; each uid drains its own canned replies."""
+
+    def __init__(self, replies_by_uid: dict[int, list[UserReply]]) -> None:
+        super().__init__([])
+        self.replies_by_uid = replies_by_uid
+        self._next_uid = 42
+
+    def new_user(self) -> int:
+        uid = self._next_uid
+        self._next_uid += 1
+        return uid
+
+    async def wait_for_ack(self, uid: int):
+        for reply in self.replies_by_uid[uid]:
+            yield reply
+
+
+def _sched_timings(**over) -> dict:
+    t = dict(queue_ms=0.0, cache_n=0, prompt_n=0, prompt_ms=0.0, predicted_n=0,
+             predicted_ms=0.0, draft_n=0, draft_n_accepted=0)
+    t.update(over)
+    return t
+
+
+def test_multi_prompt_completion_reports_the_first_prompts_own_timings():
+    """llama.cpp returns arr[0]'s slot stats for a multi-prompt completion; one clock
+    spanning the sequential loop would fold the later prompts' queue and prefill into
+    the rates while prompt_n still sums every prompt."""
+    first = _sched_timings(queue_ms=10.0, prompt_n=6, prompt_ms=300.0,
+                           predicted_n=3, predicted_ms=150.0)
+    second = _sched_timings(queue_ms=2500.0, prompt_n=9, prompt_ms=4000.0,
+                            predicted_n=4, predicted_ms=800.0)
+    state = _PerPromptState({
+        42: [UserReply(uid=42, incremental_output="a", finished=True, prompt_tokens_delta=6,
+                       completion_tokens_delta=3, timings=first)],
+        43: [UserReply(uid=43, incremental_output="b", finished=True, prompt_tokens_delta=9,
+                       completion_tokens_delta=4, timings=second)],
+    })
+    state.config.enable_timings_report = True
+
+    response = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt=["first prompt", "second prompt"]),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+
+    # usage still sums both prompts; the timings are the FIRST prompt's spans alone
+    assert response["usage"]["prompt_tokens"] == 15
+    assert response["timings"]["queue_ms"] == 10.0
+    assert response["timings"]["prompt_n"] == 6
+    assert response["timings"]["prompt_per_second"] == 20.0  # 6 tokens / 0.3 s
+    assert response["timings"]["predicted_n"] == 3
+
+
+def test_completion_and_chat_omit_timings_without_the_flag():
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True,
+                                 prompt_tokens_delta=5, completion_tokens_delta=1,
+                                 timings=_sched_timings(prompt_n=5, prompt_ms=100.0,
+                                                        predicted_n=1, predicted_ms=0.001))])
+    response = run(handle_completion(
+        CompletionRequest(model="client-model", prompt="say hi"),
+        request=None, state=state, model_sampling={},
+    ))
+    assert "timings" not in response
+    chat = run(handle_chat_completion(
+        chat_request(tools=None), request=None, state=state, model_sampling={},
+    ))
+    assert "timings" not in chat
 
 
 def test_omitted_max_tokens_honors_server_default():
@@ -672,6 +767,232 @@ def test_stream_chat_usage_chunk_carries_cached_tokens():
     usage = next(e["usage"] for e in reversed(events) if isinstance(e, dict) and e.get("usage"))
     assert usage["prompt_tokens"] == 5
     assert usage["prompt_tokens_details"] == {"cached_tokens": 3}
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completions"])
+def test_stream_continuous_usage_counts_tokens_not_chunks(endpoint):
+    # a speculative-decoding step commits several tokens in one reply
+    state = FakeState([
+        UserReply(uid=42, incremental_output="", finished=False, prompt_tokens_delta=5),
+        UserReply(uid=42, incremental_output="a", finished=False, completion_tokens_delta=1),
+        UserReply(uid=42, incremental_output="bcd", finished=True, completion_tokens_delta=3),
+    ])
+    options = {"include_usage": True, "continuous_usage_stats": True}
+    if endpoint == "chat":
+        stream = stream_chat_completion_chunks(42, chat_request(tools=None, stream_options=options), state)
+        text = lambda choice: choice["delta"].get("content")
+    else:
+        req = CompletionRequest(model="client-model", prompt="hi", stream=True, stream_options=options)
+        stream = stream_completion_chunks(42, req, state)
+        text = lambda choice: choice["text"]
+
+    async def collect():
+        return [chunk async for chunk in stream]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    deltas = [e for e in events if e["choices"] and text(e["choices"][0])]
+    assert [(e["usage"]["prompt_tokens"], e["usage"]["completion_tokens"]) for e in deltas] == [(5, 1), (5, 4)]
+
+
+def _timings_stream_state() -> FakeState:
+    state = FakeState([UserReply(
+        uid=42, incremental_output="hi", finished=True, prompt_tokens_delta=5,
+        completion_tokens_delta=2,
+        timings=_sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0),
+    )])
+    state.config.enable_timings_report = True
+    return state
+
+
+def _timings_stream_events(req):
+    state = _timings_stream_state()
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    return [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+
+
+def test_stream_timings_ride_the_usage_chunk_when_requested():
+    events = _timings_stream_events(chat_request(tools=None, stream=True,
+                                                 stream_options={"include_usage": True}))
+    carriers = [e for e in events if "timings" in e]
+    # the usage chunk is the stream's last chunk, so the timings appear exactly once, there
+    assert len(carriers) == 1
+    assert carriers[0].get("usage") is not None
+    assert carriers[0]["timings"]["prompt_per_second"] == 50.0  # 5 tokens / 0.1 s
+
+
+def test_stream_timings_ride_the_finish_chunk_without_usage():
+    events = _timings_stream_events(chat_request(tools=None, stream=True))
+    carriers = [e for e in events if "timings" in e]
+    # no usage chunk follows, so the finish chunk is the last and the only carrier
+    assert len(carriers) == 1
+    assert carriers[0]["choices"] and carriers[0]["choices"][0]["finish_reason"] is not None
+    assert all("usage" not in e for e in events)
+
+
+def test_stream_timings_stay_off_without_the_flag():
+    state = FakeState([UserReply(
+        uid=42, incremental_output="hi", finished=True, prompt_tokens_delta=5,
+        completion_tokens_delta=2,
+        timings=_sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=2, predicted_ms=50.0),
+    )])
+    req = chat_request(tools=None, stream=True, stream_options={"include_usage": True})
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = parse_sse(run(collect()))
+    assert not [e for e in events if isinstance(e, dict) and "timings" in e]
+
+
+def _pt_replies(timings_on_intermediate: bool) -> list[UserReply]:
+    """Two token acks; the terminal one always carries the snapshot (the scheduler
+    stamps it for every request), the intermediate one only when the handler's AND
+    (asked AND server flag) told the engine to stamp per-token."""
+    t1 = _sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001)
+    t2 = _sched_timings(prompt_n=5, prompt_ms=100.0, predicted_n=2, predicted_ms=40.0)
+    return [
+        UserReply(uid=42, incremental_output="a", finished=False, prompt_tokens_delta=5,
+                  completion_tokens_delta=1, timings=t1 if timings_on_intermediate else None),
+        UserReply(uid=42, incremental_output="b", finished=True, finish_reason="stop",
+                  completion_tokens_delta=1, timings=t2),
+    ]
+
+
+@pytest.mark.parametrize("asked,report", [(True, True), (False, True), (True, False)])
+def test_stream_timings_per_token_rides_every_chat_content_chunk(asked, report):
+    # the engine stamps partials only when the handler's AND passed: asked AND flag
+    state = FakeState(_pt_replies(asked and report))
+    if report:
+        state.config.enable_timings_report = True
+    # include_usage and continuous_usage_stats must coexist with the per-token blocks
+    req = chat_request(tools=None, stream=True, timings_per_token=asked,
+                       stream_options={"include_usage": True, "continuous_usage_stats": True})
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    # the role-first chunk precedes the first ack: nothing measured, never a block
+    assert "timings" not in events[0]
+    content = [e for e in events if e["choices"] and e["choices"][0]["delta"].get("content")]
+    if not report:
+        # asked but the server never opted in: no block on any chunk, finish included
+        assert all("timings" not in e for e in events)
+        return
+    if asked:
+        assert [e["timings"]["predicted_n"] for e in content] == [1, 2]
+        assert all("usage" in e for e in content)  # continuous usage keeps riding too
+    else:
+        assert all("timings" not in e for e in content)
+    # the #814 final placement survives: the usage chunk still carries the terminal snapshot
+    final = next(e for e in reversed(events) if e.get("usage") is not None and not e["choices"])
+    assert final["timings"]["predicted_n"] == 2
+
+
+@pytest.mark.parametrize("asked", [True, False])
+def test_stream_timings_per_token_off_keeps_the_post_terminal_flush_clean(asked):
+    """The terminal ack carries timings for EVERY request; text a parser flushes after
+    it (qwen3 holds a trailing partial tag to the end of stream) must attach a block
+    only for a stream that asked, else the terminal snapshot rides residue chunks."""
+    t1 = _sched_timings(prompt_n=4, prompt_ms=100.0, predicted_n=1, predicted_ms=0.001)
+    t2 = _sched_timings(prompt_n=4, prompt_ms=100.0, predicted_n=2, predicted_ms=40.0)
+    state = FakeState([
+        UserReply(uid=42, incremental_output="ok", finished=False, prompt_tokens_delta=4,
+                  completion_tokens_delta=1, timings=t1 if asked else None),
+        UserReply(uid=42, incremental_output="<", finished=True, finish_reason="stop",
+                  completion_tokens_delta=1, timings=t2),
+    ], reasoning_parser="qwen3")
+    state.config.enable_timings_report = True
+    req = chat_request(tools=None, stream=True, timings_per_token=asked)
+
+    async def collect():
+        return [chunk async for chunk in stream_chat_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    flushed = [e for e in events if e["choices"] and e["choices"][0]["delta"].get("reasoning_content") == "<"]
+    assert len(flushed) == 1
+    assert ("timings" in flushed[0]) is asked
+    if asked:
+        assert flushed[0]["timings"]["predicted_n"] == 2  # the terminal snapshot
+
+
+@pytest.mark.parametrize("asked,report", [(True, True), (False, True), (True, False)])
+def test_completions_stream_timings_per_token_rides_every_content_chunk(asked, report):
+    # the engine stamps partials only when the handler's AND passed: asked AND flag
+    state = FakeState(_pt_replies(asked and report))
+    if report:
+        state.config.enable_timings_report = True
+    options = {"include_usage": True, "continuous_usage_stats": True}
+    req = CompletionRequest(model="client-model", prompt="hi", stream=True,
+                            stream_options=options, timings_per_token=asked)
+
+    async def collect():
+        return [chunk async for chunk in stream_completion_chunks(42, req, state)]
+
+    events = [e for e in parse_sse(run(collect())) if isinstance(e, dict)]
+    content = [e for e in events if e["choices"] and e["choices"][0]["text"]]
+    if not report:
+        # asked but the server never opted in: no block on any chunk, finish included
+        assert all("timings" not in e for e in events)
+        return
+    if asked:
+        assert [e["timings"]["predicted_n"] for e in content] == [1, 2]
+        assert all("usage" in e for e in content)  # continuous usage keeps riding too
+    else:
+        assert all("timings" not in e for e in content)
+    # as on the chat stream: the final usage chunk keeps the #814 terminal placement
+    final = next(e for e in reversed(events) if not e["choices"])
+    assert final["usage"]["completion_tokens"] == 2
+    assert final["timings"]["predicted_n"] == 2
+
+
+def test_timings_per_token_only_stamps_the_engine_when_the_server_agrees():
+    """The request field is silently dropped unless the server runs with
+    --enable-timings-report AND the request streams (llama.cpp publishes partials
+    on streams only): the API layer ANDs all three before the scheduler sees it."""
+    req = chat_request(tools=None, stream=True, timings_per_token=True)
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_chat_completion(req, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # server flag off: ignored
+
+    state.config.enable_timings_report = True
+    run(handle_chat_completion(req, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_chat_completion(chat_request(tools=None, timings_per_token=True),
+                               request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
+
+    creq = CompletionRequest(model="client-model", prompt="hi", stream=True,
+                             timings_per_token=True)
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_completion(creq, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token
+
+    state.config.enable_timings_report = True
+    run(handle_completion(creq, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_completion(
+        CompletionRequest(model="client-model", prompt="hi", timings_per_token=True),
+        request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
+
+    rreq = ResponsesRequest.model_validate(
+        {"model": "gpt-x", "input": "hi", "stream": True, "timings_per_token": True})
+    state = FakeState([UserReply(uid=42, incremental_output="x", finished=True)])
+    run(handle_responses(rreq, request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # server flag off: ignored
+
+    state.config.enable_timings_report = True
+    run(handle_responses(rreq, request=None, state=state, model_sampling={}))
+    assert state.sent.sampling_params.timings_per_token
+    run(handle_responses(
+        ResponsesRequest.model_validate(
+            {"model": "gpt-x", "input": "hi", "timings_per_token": True}),
+        request=None, state=state, model_sampling={}))
+    assert not state.sent.sampling_params.timings_per_token  # not a stream: ignored
 
 
 # --------------------------------------------------------------- minimax think

@@ -84,9 +84,9 @@ class MMProcessor(ABC):
         """The checkpoint's image processor, loaded on first use (tokenizer workers share the instance across threads)."""
         with self._image_processor_lock:
             if self._image_processor_instance is None:
-                from transformers import AutoImageProcessor
+                from freetoken.utils import load_image_processor
 
-                self._image_processor_instance = AutoImageProcessor.from_pretrained(self.model_path)
+                self._image_processor_instance = load_image_processor(self.model_path)
             return self._image_processor_instance
 
     def get_mm_processor_kwargs(self, mm: MultimodalConfig) -> dict[str, Any]:
@@ -200,7 +200,8 @@ def get_mm_processor(model_path: str, mm: MultimodalConfig | None = None) -> MMP
     served = [e for e in spec.encoders if getattr(config, e.config_key, None) is not None and e.kind not in mm.disabled_encoders]
     if spec.mm_processor is None or not served:
         return None
-    check_mm_pad_shift(config.text_config.vocab_size)
+    # families with a flat checkpoint config (deepseek_v4) carry vocab_size at the top level
+    check_mm_pad_shift(getattr(config, "text_config", config).vocab_size)
     module, _, cls = spec.mm_processor.partition(":")
     return getattr(importlib.import_module(module), cls)(config, model_path, mm)
 
